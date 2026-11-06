@@ -8,13 +8,13 @@ use clap::Parser;
 use flux_types::{FluxFrontmatter, HistoryEntry};
 use markdoc::{
     Context, Node, evaluate_conditionals, parse,
-    partials::{FsPartialResolver, expand_partials},
+    partials::{PartialResolver, expand_partials},
     resolve_crossrefs, resolve_footnotes, transform_with_context,
     types::{Config, NodeType, Scalar},
 };
 use markdoc_pdf::assets::FsAssetResolver;
 use markdoc_pdf::dates;
-use markdoc_pdf::render::{RenderContext, Style, render_pdf_with};
+use markdoc_pdf::render::{ExternalTagref, RenderContext, Style, render_pdf_with};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -59,6 +59,30 @@ struct Args {
     /// and tag attributes. The value is always treated as a string.
     #[arg(long = "var", value_name = "KEY=VALUE")]
     var: Vec<String>,
+
+    /// JSON file of build-time variables (same shape as Markdoc config).
+    /// Top-level keys become `$key` in conditionals and interpolation.
+    /// `--var` entries override keys from this file.
+    #[arg(long, value_name = "FILE")]
+    variables: Option<PathBuf>,
+
+    /// JSON object of `{% tag %}` id → `{ "url", "title" }`. A `{% tagref %}`
+    /// whose target is not in this PDF becomes a link to `url`.
+    #[arg(long, value_name = "FILE")]
+    external_tagrefs: Option<PathBuf>,
+
+    /// Extra directory to resolve `{% partial file="..." /%}` against,
+    /// repeatable and tried in the order given after the input file's own
+    /// directory.
+    ///
+    /// A document set that keeps its shared partials in one tree — rather
+    /// than beside each document — cannot be rendered with a single root:
+    /// the `sections` manifest names files relative to the document, while
+    /// its pages reference partials relative to the shared tree. Naming the
+    /// shared tree here resolves both without copying anything into a
+    /// staging directory.
+    #[arg(long = "partials-root", value_name = "DIR")]
+    partials_root: Vec<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -107,8 +131,24 @@ fn run(args: &Args) -> Result<(), AppError> {
         None => Style::default(),
     };
 
-    // ── Collect CLI `--var key=value` build-time variables. ────────
+    // ── Collect build-time variables (`--variables` file + `--var`). ─
     let mut cli_vars: HashMap<String, Scalar> = HashMap::new();
+    if let Some(path) = &args.variables {
+        if !path.exists() {
+            return Err(AppError::VariablesMissing(path.clone()));
+        }
+        let raw = fs::read_to_string(path).map_err(|e| AppError::Read(path.clone(), e))?;
+        let json: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| AppError::VariablesLoad(path.clone(), e.to_string()))?;
+        if let serde_json::Value::Object(map) = json {
+            for (key, value) in map {
+                if key == "$schema" {
+                    continue;
+                }
+                cli_vars.insert(key, json_to_scalar(&value));
+            }
+        }
+    }
     for pair in &args.var {
         match pair.split_once('=') {
             Some((k, v)) => {
@@ -123,6 +163,7 @@ fn run(args: &Args) -> Result<(), AppError> {
     // ── Read + parse the source. ───────────────────────────────────
     let source =
         fs::read_to_string(&args.input).map_err(|e| AppError::Read(args.input.clone(), e))?;
+    // Variables resolve at transform time via Context (below), not at parse.
     let doc =
         parse(&source, None).map_err(|e| AppError::Parse(args.input.clone(), e.to_string()))?;
 
@@ -141,7 +182,11 @@ fn run(args: &Args) -> Result<(), AppError> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    let partial_resolver = FsPartialResolver::new(partial_root);
+    let partial_resolver = MultiRootPartialResolver::new(
+        std::iter::once(partial_root)
+            .chain(args.partials_root.iter().cloned())
+            .collect(),
+    );
     let doc = expand_partials(&doc, &partial_resolver)
         .map_err(|e| AppError::Partials(args.input.clone(), e.to_string()))?;
 
@@ -196,7 +241,7 @@ fn run(args: &Args) -> Result<(), AppError> {
     };
     let creation_date = fm_opt
         .as_ref()
-        .and_then(|fm| fm.release_date.as_deref())
+        .and_then(|fm| fm.update_date.as_deref().or(fm.release_date.as_deref()))
         .and_then(dates::parse_iso)
         .or_else(|| Some(dates::now()));
     let authors = fm_opt
@@ -207,16 +252,18 @@ fn run(args: &Args) -> Result<(), AppError> {
         .as_ref()
         .and_then(|fm| fm.creator.clone())
         .or_else(|| Some("markdoc-pdf".to_string()));
-    let date_string = fm_opt
-        .as_ref()
-        .and_then(|fm| fm.release_date.as_deref())
-        .map(dates::iso_to_date_only);
+    let date_string = fm_opt.as_ref().and_then(|fm| {
+        fm.update_date
+            .as_deref()
+            .or(fm.release_date.as_deref())
+            .map(dates::iso_to_date_only)
+    });
 
     // Expose the document's own frontmatter as template variables for
     // header/footer and cover-page templates (`{version}`, `{language}`,
-    // … — whatever the author wrote). The renderer stays domain-agnostic:
-    // every scalar frontmatter field is surfaced under its authored key,
-    // with no hard-coded field names here. Unset fields simply never
+    // `{products}`, … — whatever the author wrote). The renderer stays
+    // domain-agnostic: every scalar (or flat list of scalars, joined with
+    // ", ") is surfaced under its authored key. Unset fields simply never
     // appear, so their `{name}` token stays literal (and detail lines
     // that resolve to nothing are skipped).
     let mut vars: HashMap<String, String> = HashMap::new();
@@ -234,7 +281,13 @@ fn run(args: &Args) -> Result<(), AppError> {
         dates::copyright_year_span(first_year, dates::current_year()),
     );
 
+    let external_tagrefs = match &args.external_tagrefs {
+        Some(path) => load_external_tagrefs(path)?,
+        None => HashMap::new(),
+    };
+
     let render_ctx = RenderContext {
+        external_tagrefs,
         title: fm_opt
             .as_ref()
             .and_then(|fm| fm.title.clone())
@@ -294,6 +347,72 @@ fn expand_sections(mut doc: Node, input: &Path) -> Node {
         }
     }
     doc
+}
+
+/// Resolve `{% partial %}` paths against several roots, in order.
+///
+/// `FsPartialResolver` holds one root, which is right when a document's
+/// partials sit beside it. It is not enough for a document set whose pages
+/// live in one tree and whose shared partials live in another: the
+/// `sections` manifest names files relative to the document, and those same
+/// pages reference partials relative to the shared tree. One root can serve
+/// one of those, never both.
+///
+/// First root that holds the file wins, so the document's own directory
+/// (always first) can shadow a shared partial of the same name. A path that
+/// no root holds reports every root tried, because "no such file" against a
+/// single guessed root is the least useful form of that error.
+struct MultiRootPartialResolver {
+    roots: Vec<PathBuf>,
+}
+
+impl MultiRootPartialResolver {
+    fn new(roots: Vec<PathBuf>) -> Self {
+        Self { roots }
+    }
+
+    /// The first root under which `path` exists.
+    fn locate(&self, path: &Path) -> Option<PathBuf> {
+        self.roots
+            .iter()
+            .map(|r| r.join(path))
+            .find(|full| full.is_file())
+    }
+
+    fn not_found(&self, path: &Path) -> markdoc::types::MarkdocError {
+        let tried = self
+            .roots
+            .iter()
+            .map(|r| r.join(path).display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        markdoc::types::MarkdocError::TransformError(format!(
+            "Partial {:?} not found. Tried: {tried}",
+            path.display()
+        ))
+    }
+}
+
+impl PartialResolver for MultiRootPartialResolver {
+    fn load(&self, path: &Path) -> markdoc::types::Result<String> {
+        let full = self.locate(path).ok_or_else(|| self.not_found(path))?;
+        std::fs::read_to_string(&full).map_err(|e| {
+            markdoc::types::MarkdocError::TransformError(format!(
+                "Failed to read partial {:?}: {e}",
+                full.display()
+            ))
+        })
+    }
+
+    fn canonicalize(&self, path: &Path) -> markdoc::types::Result<PathBuf> {
+        let full = self.locate(path).ok_or_else(|| self.not_found(path))?;
+        std::fs::canonicalize(&full).map_err(|e| {
+            markdoc::types::MarkdocError::TransformError(format!(
+                "Failed to canonicalize partial path {:?}: {e}",
+                full.display()
+            ))
+        })
+    }
 }
 
 /// Resolve a `sections` path to a `{% partial %}` `file=` value relative to
@@ -383,12 +502,73 @@ fn document_history_nodes(history: &[HistoryEntry], title: Option<&str>) -> Vec<
     parse(&src, None).map(|d| d.children).unwrap_or_default()
 }
 
+/// Convert a JSON value from `--variables` into Markdoc's `Scalar` type.
+fn load_external_tagrefs(path: &Path) -> Result<HashMap<String, ExternalTagref>, AppError> {
+    if !path.exists() {
+        return Err(AppError::ExternalTagrefs(
+            path.to_path_buf(),
+            "file not found".into(),
+        ));
+    }
+    let raw = fs::read_to_string(path).map_err(|e| AppError::Read(path.to_path_buf(), e))?;
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| AppError::ExternalTagrefs(path.to_path_buf(), e.to_string()))?;
+    let serde_json::Value::Object(map) = json else {
+        return Err(AppError::ExternalTagrefs(
+            path.to_path_buf(),
+            "expected a JSON object of tag id to {url, title}".into(),
+        ));
+    };
+
+    let mut out = HashMap::new();
+    for (id, value) in map {
+        let Some(obj) = value.as_object() else {
+            continue;
+        };
+        let url = obj
+            .get("url")
+            .and_then(|entry| entry.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if url.is_empty() {
+            continue;
+        }
+        let title = obj
+            .get("title")
+            .and_then(|entry| entry.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.insert(id, ExternalTagref { url, title });
+    }
+    Ok(out)
+}
+
+fn json_to_scalar(value: &serde_json::Value) -> Scalar {
+    match value {
+        serde_json::Value::Null => Scalar::Null,
+        serde_json::Value::Bool(b) => Scalar::Boolean(*b),
+        serde_json::Value::Number(n) => Scalar::Number(n.as_f64().unwrap_or(0.0)),
+        serde_json::Value::String(s) => Scalar::String(s.clone()),
+        serde_json::Value::Array(items) => {
+            Scalar::Array(items.iter().map(json_to_scalar).collect())
+        }
+        serde_json::Value::Object(map) => Scalar::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_to_scalar(v)))
+                .collect(),
+        ),
+    }
+}
+
 /// Surface every scalar frontmatter field as a template variable keyed
-/// by its authored name. Nested values (arrays / objects) and empty
-/// strings are skipped — they have no single sensible string form. The
-/// renderer never sees the field *names*, so it stays domain-agnostic:
-/// whatever the document declares (`version`, `language`, a custom
-/// `productLine`, …) becomes referenceable as `{name}`.
+/// by its authored name. Arrays of scalars are joined with `", "` (so
+/// `{orderNumber}` / `{products}` render as a single value or a
+/// comma-separated list). Nested objects, empty arrays, and empty
+/// strings are skipped. The renderer never sees the field *names*, so
+/// it stays domain-agnostic: whatever the document declares
+/// (`version`, `language`, a custom `productLine`, …) becomes
+/// referenceable as `{name}`.
 fn collect_frontmatter_vars(doc: &markdoc::ast::Node, vars: &mut HashMap<String, String>) {
     let Some(Scalar::Object(map)) = doc.attributes.get("frontmatter") else {
         return;
@@ -401,8 +581,9 @@ fn collect_frontmatter_vars(doc: &markdoc::ast::Node, vars: &mut HashMap<String,
 }
 
 /// Render a scalar as a flat template string. Whole-number floats print
-/// without a fractional part (YAML integers arrive as `f64`). Non-scalar
-/// or empty values yield `None`.
+/// without a fractional part (YAML integers arrive as `f64`). Arrays of
+/// scalars join with `", "`. Objects, nested arrays, null, and empty
+/// values yield `None`.
 fn scalar_to_template_string(value: &Scalar) -> Option<String> {
     match value {
         Scalar::String(s) if !s.trim().is_empty() => Some(s.clone()),
@@ -410,7 +591,23 @@ fn scalar_to_template_string(value: &Scalar) -> Option<String> {
         Scalar::Number(n) if n.is_finite() && n.fract() == 0.0 => Some(format!("{}", *n as i64)),
         Scalar::Number(n) => Some(n.to_string()),
         Scalar::Boolean(b) => Some(b.to_string()),
-        Scalar::Null | Scalar::Array(_) | Scalar::Object(_) => None,
+        Scalar::Array(items) => {
+            // Only flat lists of scalars (e.g. `products`, `orderNumber`).
+            // `documentHistory` (array of objects) stays out of templates.
+            if items
+                .iter()
+                .any(|item| matches!(item, Scalar::Array(_) | Scalar::Object(_)))
+            {
+                return None;
+            }
+            let parts: Vec<String> = items.iter().filter_map(scalar_to_template_string).collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(", "))
+            }
+        }
+        Scalar::Null | Scalar::Object(_) => None,
     }
 }
 
@@ -425,6 +622,9 @@ enum AppError {
     OutputDirMissing(PathBuf),
     AssetsRootMissing(PathBuf),
     StyleLoad(PathBuf, String),
+    VariablesMissing(PathBuf),
+    VariablesLoad(PathBuf, String),
+    ExternalTagrefs(PathBuf, String),
     Read(PathBuf, std::io::Error),
     Write(PathBuf, std::io::Error),
     Parse(PathBuf, String),
@@ -465,7 +665,7 @@ impl AppError {
                 "partial paths are resolved against the input file's directory; check spelling and that the file exists.".into(),
             ],
             AppError::Conditionals(_, _) => vec![
-                "{% if expr %} branches must reference variables defined in frontmatter, via --var, or via Context.".into(),
+                "{% if expr %} branches must reference variables defined in frontmatter, via --var / --variables, or via Context.".into(),
             ],
             AppError::Transform(_, _) => vec![
                 "transform errors usually mean a tag failed schema validation — check the spelling and required attributes.".into(),
@@ -488,6 +688,15 @@ impl std::fmt::Display for AppError {
             }
             AppError::StyleLoad(p, msg) => {
                 write!(f, "couldn't load style {}: {msg}", p.display())
+            }
+            AppError::VariablesMissing(p) => {
+                write!(f, "variables file not found: {}", p.display())
+            }
+            AppError::VariablesLoad(p, msg) => {
+                write!(f, "couldn't load variables {}: {msg}", p.display())
+            }
+            AppError::ExternalTagrefs(p, msg) => {
+                write!(f, "couldn't load external tagrefs {}: {msg}", p.display())
             }
             AppError::Read(p, e) => write!(f, "couldn't read {}: {e}", p.display()),
             AppError::Write(p, e) => write!(f, "couldn't write {}: {e}", p.display()),
@@ -555,6 +764,39 @@ mod tests {
         assert_eq!(
             scalar_to_template_string(&Scalar::Object(std::collections::HashMap::new())),
             None
+        );
+        // Arrays of objects (e.g. documentHistory) are not flattened.
+        assert_eq!(
+            scalar_to_template_string(&Scalar::Array(vec![Scalar::Object(
+                std::collections::HashMap::new()
+            )])),
+            None
+        );
+    }
+
+    #[test]
+    fn scalar_arrays_join_with_comma() {
+        assert_eq!(
+            scalar_to_template_string(&Scalar::Array(vec![Scalar::String("MiR250".into())]))
+                .as_deref(),
+            Some("MiR250")
+        );
+        assert_eq!(
+            scalar_to_template_string(&Scalar::Array(vec![
+                Scalar::String("MiR250".into()),
+                Scalar::String("MiR600".into()),
+            ]))
+            .as_deref(),
+            Some("MiR250, MiR600")
+        );
+        // YAML integers in orderNumber lists.
+        assert_eq!(
+            scalar_to_template_string(&Scalar::Array(vec![
+                Scalar::Number(450314.0),
+                Scalar::Number(450315.0),
+            ]))
+            .as_deref(),
+            Some("450314, 450315")
         );
     }
 

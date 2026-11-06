@@ -11,12 +11,16 @@
 
 mod block;
 mod coverpage;
+mod crossref_labels;
 mod decoration;
 mod emit;
+mod external_tagrefs;
 mod fonts;
 mod highlight;
 mod hyphen;
 mod inline;
+#[cfg(feature = "mermaid")]
+mod mermaid;
 mod paginate;
 pub mod style;
 mod text;
@@ -43,6 +47,7 @@ use style::{PdfExportProfile, TocPosition};
 use crate::assets::AssetResolver;
 
 use block::LayoutCtx;
+pub use external_tagrefs::ExternalTagref;
 pub use style::{Style, StyleLoadError};
 
 /// Caller-supplied context that the renderer can interpolate into
@@ -83,6 +88,9 @@ pub struct RenderContext {
     /// …) without the renderer knowing those field names. Unknown names
     /// are left as literal `{name}` so typos are visible.
     pub vars: HashMap<String, String>,
+    /// Website pages for `{% tag %}` ids. A `{% tagref %}` whose target
+    /// is not declared in this PDF becomes a link to `url`.
+    pub external_tagrefs: HashMap<String, ExternalTagref>,
 }
 
 /// Per-page template context built internally during emission.
@@ -194,6 +202,16 @@ pub fn render_pdf_with(
     assets: &dyn AssetResolver,
     ctx: &RenderContext,
 ) -> Result<Vec<u8>, RenderError> {
+    let rewritten = if ctx.external_tagrefs.is_empty() {
+        None
+    } else {
+        Some(external_tagrefs::externalize_out_of_scope_tagrefs(
+            root,
+            &ctx.external_tagrefs,
+        ))
+    };
+    let root = rewritten.as_ref().unwrap_or(root);
+
     let mut font_cx = FontContext::default();
     let mut layout_cx = LayoutContext::new();
     let mut font_cache: HashMap<u64, Font> = HashMap::new();
@@ -219,6 +237,7 @@ pub fn render_pdf_with(
     let hyphenator = hyphen::WordHyphenator::from_style(&style.hyphenation);
 
     // 1. Layout.
+    let crossref_labels = crossref_labels::build_crossref_labels(root, &style.heading_numbering);
     let (blocks, footnotes) = {
         let mut lctx = LayoutCtx {
             style,
@@ -237,6 +256,7 @@ pub fn render_pdf_with(
             heading_counters: [0; 6],
             list_depth: 0,
             cell_content_align: None,
+            crossref_labels: &crossref_labels,
         };
         let blocks = block::layout_document(root, &mut lctx);
         (blocks, lctx.footnotes)
@@ -251,11 +271,6 @@ pub fn render_pdf_with(
         .clone()
         .unwrap_or_else(crate::dates::today_yyyy_mm_dd);
     let mut blocks = blocks;
-    // Number of leading pages the cover occupies (0 when disabled). The
-    // cover emits one `PageBreak` per page it produces (plus an optional
-    // blank verso), so counting them gives the page count without a
-    // separate pagination pass. Used to keep the cover ahead of any
-    // start-positioned ToC / LoF / LoT.
     let mut cover_page_count = 0usize;
     if style.coverpage.enabled {
         let mut fp = coverpage::build_coverpage_blocks(
@@ -288,9 +303,6 @@ pub fn render_pdf_with(
         .as_ref()
         .map(|f| f.reserved_height())
         .unwrap_or(0.0);
-    // Optional notice banner — a tall masthead at the top of every page.
-    // It starts at `banner_band_top` and its `height` plus a gap pushes
-    // the body down; reserve the extra space beyond the normal top margin.
     let banner_band_top = style.margin_y * 0.42;
     let banner_reserved = style
         .page_decoration
@@ -307,13 +319,11 @@ pub fn render_pdf_with(
     let inner_x = style.margin_x;
     let inner_w = style.page_width - 2.0 * style.margin_x;
 
-    // The cover page (page 0) may carry its own vertical margin
-    // (`CoverPageStyle::margin_y`) so a tall hero can bleed toward the page
-    // edges. When set, the first page gets its own budget and start; since it
-    // skips its header / footer, its whole height between the cover margins is
-    // available. (Its horizontal margin is baked into the cover blocks' x.)
-    let cover_first_page = style.coverpage.enabled
-        && (style.coverpage.margin_x.is_some() || style.coverpage.margin_y.is_some());
+    // A synthesised cover always uses its own first-page geometry. Previously
+    // this only kicked in when `coverpage.margin_x` / `margin_y` were set, so
+    // a default cover still reserved header/footer space — even with
+    // `skip_first_page`. Auto-fit heroes then overflowed onto page 2.
+    let cover_first_page = style.coverpage.enabled;
     let cover_margin_y = style.coverpage.margin_y.unwrap_or(style.margin_y);
     let cover_hf = if style.page_decoration.skip_first_page {
         0.0
@@ -336,38 +346,56 @@ pub fn render_pdf_with(
         body_start_y
     };
 
+    let column_layout = if style.page_layout.columns > 1 {
+        Some(emit::PageColumnLayout {
+            columns: style.page_layout.columns,
+            column_width: (inner_w
+                - style.page_layout.gap * (style.page_layout.columns as f32 - 1.0))
+                / style.page_layout.columns as f32,
+            gap: style.page_layout.gap,
+        })
+    } else {
+        None
+    };
+
     // Footnote-aware pagination: pool height is recomputed every time
     // a block carrying footnote calls is added, so the body budget
     // shrinks dynamically as footnotes accumulate.
     let body_with_pools: Vec<(Vec<block::Block>, Vec<block::Block>)> = {
         let footnotes = &footnotes;
-        paginate::paginate_with_footnotes(blocks, page_budget, first_page_budget, |numbers| {
-            if numbers.is_empty() {
-                return (0.0, Vec::new());
-            }
-            let mut entries: Vec<(u32, String)> = numbers
-                .iter()
-                .filter_map(|n| {
-                    footnotes
-                        .get((*n as usize).saturating_sub(1))
-                        .filter(|b| !b.is_empty())
-                        .map(|b| (*n, b.clone()))
-                })
-                .collect();
-            entries.sort_by_key(|(n, _)| *n);
-            entries.dedup_by_key(|(n, _)| *n);
-            let pool = block::build_footnote_pool_blocks(
-                &entries,
-                style,
-                fonts.footnote,
-                &mut font_cx,
-                &mut layout_cx,
-                inner_x,
-                inner_w,
-            );
-            let h = block::pool_height(&pool);
-            (h, pool)
-        })
+        paginate::paginate_with_footnotes(
+            blocks,
+            page_budget,
+            first_page_budget,
+            style.page_layout.columns,
+            |numbers| {
+                if numbers.is_empty() {
+                    return (0.0, Vec::new());
+                }
+                let mut entries: Vec<(u32, String)> = numbers
+                    .iter()
+                    .filter_map(|n| {
+                        footnotes
+                            .get((*n as usize).saturating_sub(1))
+                            .filter(|b| !b.is_empty())
+                            .map(|b| (*n, b.clone()))
+                    })
+                    .collect();
+                entries.sort_by_key(|(n, _)| *n);
+                entries.dedup_by_key(|(n, _)| *n);
+                let pool = block::build_footnote_pool_blocks(
+                    &entries,
+                    style,
+                    fonts.footnote,
+                    &mut font_cx,
+                    &mut layout_cx,
+                    inner_x,
+                    inner_w,
+                );
+                let h = block::pool_height(&pool);
+                (h, pool)
+            },
+        )
     };
 
     // ── Optional: synthesise & insert ToC / List of Figures / List of Tables ─
@@ -398,12 +426,12 @@ pub fn render_pdf_with(
     } else {
         body_with_pools
     };
-    // Duplex padding: if the document ends on an odd page, append one
-    // page so the physical sheet count is even. The padding page carries
-    // the running header / footer (and watermark) like any other page, but
-    // has no body content. `total_pages` is taken AFTER padding so the
-    // `{total}` page-of count includes it.
-    if needs_even_padding(pages.len(), style.pad_to_even) {
+    // Trailing blank pages so the physical count matches the configured
+    // multiple (`pad_to_multiple`, or 2 when only `pad_to_even` is set).
+    // Each padding page carries the running header / footer (and watermark)
+    // like any other page, but has no body content. `total_pages` is taken
+    // AFTER padding so the `{total}` page-of count includes them.
+    for _ in 0..padding_page_count(pages.len(), style.padding_multiple()) {
         pages.push((Vec::new(), Vec::new()));
     }
     let total_pages = pages.len();
@@ -427,7 +455,7 @@ pub fn render_pdf_with(
     // emit to resolve `{% tagref %}` internal links (`href = "#id"`)
     // to PDF GoTo destinations. We can't defer this until after the
     // emit loop because annotations must be added before page.finish().
-    let anchor_map = collect_anchor_map(&pages, body_start_y);
+    let anchor_map = collect_anchor_map(&pages, body_start_y, column_layout);
 
     let mut document = build_document(style.pdf_export);
     apply_metadata(&mut document, ctx);
@@ -487,6 +515,7 @@ pub fn render_pdf_with(
                 &mut links,
                 &mut outline_pts,
                 &mut page_tags,
+                column_layout,
             );
 
             // Footnote pool: floats at the bottom of the printable
@@ -504,6 +533,7 @@ pub fn render_pdf_with(
                     &mut links,
                     &mut outline_pts,
                     &mut page_tags,
+                    None,
                 );
             }
 
@@ -725,10 +755,11 @@ fn document_has_no_pages(_doc: &Document) -> bool {
 fn collect_anchor_map(
     pages: &[(Vec<block::Block>, Vec<block::Block>)],
     body_start_y: f32,
+    columns: Option<emit::PageColumnLayout>,
 ) -> std::collections::HashMap<String, (usize, f32)> {
     let mut map = std::collections::HashMap::new();
     for (page_idx, (page_blocks, _pool)) in pages.iter().enumerate() {
-        walk_anchors(page_blocks, page_idx, body_start_y, &mut map);
+        walk_anchors(page_blocks, page_idx, body_start_y, columns, &mut map);
     }
     map
 }
@@ -737,75 +768,104 @@ fn walk_anchors(
     blocks: &[block::Block],
     page_idx: usize,
     start_y: f32,
+    columns: Option<emit::PageColumnLayout>,
+    map: &mut std::collections::HashMap<String, (usize, f32)>,
+) {
+    if columns.map(|c| c.columns).unwrap_or(1) <= 1 {
+        walk_anchors_single(blocks, page_idx, start_y, map);
+        return;
+    }
+    let layout = columns.unwrap();
+    let n = layout.columns.max(1) as usize;
+    let mut col_y = vec![start_y; n];
+    for block in blocks {
+        let col_idx = block.page_column.min(layout.columns.saturating_sub(1)) as usize;
+        let y = if block.column_span {
+            col_y.iter().copied().fold(start_y, f32::max)
+        } else {
+            col_y[col_idx]
+        };
+        record_block_anchors(block, page_idx, y, map);
+        let advance = block.height + block.space_after;
+        if block.column_span {
+            let new_y = y + advance;
+            col_y.fill(new_y);
+        } else {
+            col_y[col_idx] = y + advance;
+        }
+    }
+}
+
+fn walk_anchors_single(
+    blocks: &[block::Block],
+    page_idx: usize,
+    start_y: f32,
     map: &mut std::collections::HashMap<String, (usize, f32)>,
 ) {
     let mut y = start_y;
     for block in blocks {
-        if let Some(id) = &block.anchor_id {
-            map.entry(id.clone()).or_insert((page_idx, y));
-        }
-        match &block.draw {
-            block::BlockDraw::Text(slice)
-                // Mid-paragraph anchors. For each declared (byte_offset, id),
-                // find the line containing the byte and compute its y
-                // relative to the slice's drawn top (this block's `y`).
-                if !slice.mid_anchors.is_empty() => {
-                    for anchor in slice.mid_anchors.iter() {
-                        if let Some(line_y_offset) =
-                            mid_anchor_y_in_slice(slice, anchor.byte_offset)
-                        {
-                            map.entry(anchor.id.clone())
-                                .or_insert((page_idx, y + line_y_offset));
-                        }
-                    }
-                }
-            block::BlockDraw::BoxedGroup {
-                children, padding, ..
-            } => {
-                walk_anchors(children, page_idx, y + *padding, map);
-            }
-            block::BlockDraw::ListItem { body, .. } => {
-                walk_anchors(body, page_idx, y, map);
-            }
-            block::BlockDraw::Table {
-                rows,
-                cell_padding,
-                border_thickness,
-                ..
-            } => {
-                let mut row_top = y + *border_thickness;
-                for row in rows {
-                    for cell in &row.cells {
-                        walk_anchors(&cell.blocks, page_idx, row_top + *cell_padding, map);
-                    }
-                    row_top += row.height + *border_thickness;
-                }
-            }
-            block::BlockDraw::Float { image, wrap } => {
-                // Image and wrap both stack from the float's top; the wrap
-                // slice advances y internally per block, matching emit.
-                walk_anchors(std::slice::from_ref(image.as_ref()), page_idx, y, map);
-                walk_anchors(wrap, page_idx, y, map);
-            }
-            block::BlockDraw::FloatRegion { text, floats } => {
-                // Mid-paragraph anchors resolve within the prose slice; each
-                // floated image resolves at its own offset below the top.
-                for anchor in text.mid_anchors.iter() {
-                    if let Some(dy) = mid_anchor_y_in_slice(text, anchor.byte_offset) {
-                        map.entry(anchor.id.clone())
-                            .or_insert((page_idx, y + dy));
-                    }
-                }
-                for fl in floats {
-                    if let Some(id) = &fl.image.anchor_id {
-                        map.entry(id.clone())
-                            .or_insert((page_idx, y + fl.y_offset));
-                    }
-                }
-            }
-            _ => {}
-        }
+        record_block_anchors(block, page_idx, y, map);
         y += block.height + block.space_after;
+    }
+}
+
+fn record_block_anchors(
+    block: &block::Block,
+    page_idx: usize,
+    y: f32,
+    map: &mut std::collections::HashMap<String, (usize, f32)>,
+) {
+    if let Some(id) = &block.anchor_id {
+        map.entry(id.clone()).or_insert((page_idx, y));
+    }
+    match &block.draw {
+        block::BlockDraw::Text(slice) if !slice.mid_anchors.is_empty() => {
+            for anchor in slice.mid_anchors.iter() {
+                if let Some(line_y_offset) = mid_anchor_y_in_slice(slice, anchor.byte_offset) {
+                    map.entry(anchor.id.clone())
+                        .or_insert((page_idx, y + line_y_offset));
+                }
+            }
+        }
+        block::BlockDraw::BoxedGroup {
+            children, padding, ..
+        } => {
+            walk_anchors_single(children, page_idx, y + *padding, map);
+        }
+        block::BlockDraw::ListItem { body, .. } => {
+            walk_anchors_single(body, page_idx, y, map);
+        }
+        block::BlockDraw::Table {
+            rows,
+            cell_padding,
+            border_thickness,
+            ..
+        } => {
+            let mut row_top = y + *border_thickness;
+            for row in rows {
+                for cell in &row.cells {
+                    walk_anchors_single(&cell.blocks, page_idx, row_top + *cell_padding, map);
+                }
+                row_top += row.height + *border_thickness;
+            }
+        }
+        block::BlockDraw::Float { image, wrap } => {
+            walk_anchors_single(std::slice::from_ref(image.as_ref()), page_idx, y, map);
+            walk_anchors_single(wrap, page_idx, y, map);
+        }
+        block::BlockDraw::FloatRegion { text, floats } => {
+            for anchor in text.mid_anchors.iter() {
+                if let Some(dy) = mid_anchor_y_in_slice(text, anchor.byte_offset) {
+                    map.entry(anchor.id.clone()).or_insert((page_idx, y + dy));
+                }
+            }
+            for fl in floats {
+                if let Some(id) = &fl.image.anchor_id {
+                    map.entry(id.clone()).or_insert((page_idx, y + fl.y_offset));
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1338,30 +1398,50 @@ fn apply_metadata(document: &mut Document, ctx: &RenderContext) {
     document.set_metadata(meta);
 }
 
-/// Whether a trailing page must be appended so the physical page count is
-/// even. Duplex (double-sided) printing wants each document to begin on the
-/// front of a fresh sheet, which requires an even total. `content_pages` is
-/// the count before padding; an empty document (0 pages) is already even and
-/// is left untouched.
-fn needs_even_padding(content_pages: usize, pad_to_even: bool) -> bool {
-    pad_to_even && content_pages % 2 == 1
+/// How many blank pages to append so `content_pages` is a multiple of
+/// `multiple`. `multiple <= 1` or an empty document (0 pages) adds nothing.
+fn padding_page_count(content_pages: usize, multiple: usize) -> usize {
+    if multiple <= 1 || content_pages == 0 {
+        return 0;
+    }
+    let rem = content_pages % multiple;
+    if rem == 0 { 0 } else { multiple - rem }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::needs_even_padding;
+    use super::padding_page_count;
+    use super::style::Style;
 
     #[test]
-    fn even_padding_only_pads_odd_counts_when_enabled() {
-        // Enabled: an odd page count gains a trailing page; even is untouched.
-        assert!(needs_even_padding(1, true));
-        assert!(needs_even_padding(3, true));
-        assert!(!needs_even_padding(2, true));
-        assert!(!needs_even_padding(6, true));
-        // An empty document (0 pages) is already even.
-        assert!(!needs_even_padding(0, true));
-        // Disabled: never pads, regardless of parity.
-        assert!(!needs_even_padding(1, false));
-        assert!(!needs_even_padding(2, false));
+    fn padding_page_count_even_and_booklet() {
+        // Multiple of 2 (duplex): one blank when odd, none when even.
+        assert_eq!(padding_page_count(1, 2), 1);
+        assert_eq!(padding_page_count(3, 2), 1);
+        assert_eq!(padding_page_count(2, 2), 0);
+        assert_eq!(padding_page_count(6, 2), 0);
+        // Multiple of 4 (booklet): 1–3 blanks until the count is divisible by 4.
+        assert_eq!(padding_page_count(1, 4), 3);
+        assert_eq!(padding_page_count(2, 4), 2);
+        assert_eq!(padding_page_count(3, 4), 1);
+        assert_eq!(padding_page_count(4, 4), 0);
+        assert_eq!(padding_page_count(5, 4), 3);
+        assert_eq!(padding_page_count(6, 4), 2);
+        assert_eq!(padding_page_count(7, 4), 1);
+        assert_eq!(padding_page_count(8, 4), 0);
+        // Empty document and disabled multiple add nothing.
+        assert_eq!(padding_page_count(0, 4), 0);
+        assert_eq!(padding_page_count(3, 0), 0);
+        assert_eq!(padding_page_count(3, 1), 0);
+    }
+
+    #[test]
+    fn padding_multiple_prefers_explicit_over_even() {
+        let mut style = Style::default();
+        assert_eq!(style.padding_multiple(), 0);
+        style.pad_to_even = true;
+        assert_eq!(style.padding_multiple(), 2);
+        style.pad_to_multiple = 4;
+        assert_eq!(style.padding_multiple(), 4);
     }
 }

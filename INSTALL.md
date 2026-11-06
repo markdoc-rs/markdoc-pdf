@@ -1,9 +1,19 @@
 # Installing markdoc-pdf
 
 `markdoc-pdf` is a single binary. It has no runtime dependencies
-beyond the OS — no Java, no Python, no Pandoc — and produces PDFs
-out of the box (the bundled Noto Sans family covers Latin scripts;
-custom fonts are loadable via the style file).
+beyond the OS and **fonts** — no Java, no Python, no Pandoc.
+
+> **Fonts are a hard runtime requirement.** Nothing is embedded in
+> the binary. `markdoc-pdf` asks for font *families* by name ("Noto
+> Sans", "Noto Sans Mono", …) and resolves them against whatever is
+> installed on the machine. With no fonts installed it panics with
+> `NoMatch` from `fontique` before writing anything. Install Noto
+> Sans — `apk add font-noto`, `apt install fonts-noto-core`, or
+> `dnf install google-noto-sans-fonts` — and every Latin-script
+> language renders. Windows and macOS already ship families that are
+> in the fallback chain (Segoe UI / Arial, Helvetica), so this only
+> bites on minimal Linux images and containers. Custom and branded
+> fonts are loadable via `font_paths` in the style file.
 
 ## Option A: install from source with Cargo (Linux / macOS)
 
@@ -174,10 +184,32 @@ better for iteration.
 
 ## Option E: pre-built binaries
 
-Available as GitHub release artefacts once a tagged release lands.
-The CI workflow at `.github/workflows/release.yml` builds binaries
-for **Linux x86_64**, **macOS arm64** and **Windows x86_64** on
-tag pushes — see the repository's Releases page for the latest.
+Attached to each tagged release on the forge. The workflow at
+`.forgejo/workflows/release.yml` builds four of them on a tag push:
+
+| Asset | Platform |
+|-------|----------|
+| `markdoc-pdf-linux-x86_64` | Linux x86-64, static (musl) |
+| `markdoc-pdf-linux-aarch64` | Linux ARM64, static (musl) |
+| `markdoc-pdf-windows-x86_64.exe` | Windows x86-64, MSVC ABI, static CRT |
+| `markdoc-pdf-windows-aarch64.exe` | Windows ARM64, MSVC ABI, static CRT |
+
+Each ships a `.sha256` beside it, and `themes.tar.gz` / `themes.zip`
+carry the `examples/themes/` catalogue that `--style` needs.
+
+Download, `chmod +x`, drop it on `$PATH`:
+
+```sh
+curl -LO https://git.mirdev.net/jalu/markdoc-pdf/releases/download/0.5.0/markdoc-pdf-linux-x86_64
+chmod +x markdoc-pdf-linux-x86_64
+sudo mv markdoc-pdf-linux-x86_64 /usr/local/bin/markdoc-pdf
+```
+
+The Linux binaries are statically linked — `static-pie`, zero `NEEDED`
+entries — so they run on any glibc or musl distro regardless of its
+libc version. They still need fonts installed; see the note at the
+top of this file. macOS is not built: the runners are Linux and
+Apple's SDK is not redistributable, so build from source (Option A).
 
 ## Updating
 
@@ -229,7 +261,16 @@ Update with `rustup update stable`.
 sibling crates that talk to a database. `markdoc-pdf` itself has no
 database dependency; you can ignore the warnings.
 
-**Fonts look wrong / missing characters** — the bundled Noto Sans
-family covers Latin / Cyrillic / Greek / Arabic / Devanagari plus
-emoji. For other scripts or branded fonts, use `font_paths` and
-`body_font_families` in your style file (see `examples/themes/README.md`).
+**`panicked at … fontique … NoMatch`** — no usable font is installed.
+See the note at the top of this file; `apk add font-noto` /
+`apt install fonts-noto-core` fixes it. A `FROM scratch` container
+needs the `.ttf` files copied into `/usr/share/fonts/` next to the
+binary (fontconfig's own `/etc/fonts/fonts.conf` is optional — without
+it you get a warning on stderr and a correct PDF).
+
+**Fonts look wrong / missing characters** — the default family chain
+leads with Noto Sans and falls through script-specific Noto faces,
+DejaVu / Liberation, and the Windows and macOS system families. Only
+the ones actually installed participate. Install the Noto face for
+the script in question, or point `font_paths` and
+`body_font_families` at your own (see `examples/themes/README.md`).

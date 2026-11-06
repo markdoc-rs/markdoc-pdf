@@ -1,6 +1,6 @@
 [package]
 name = "markdoc-pdf"
-version = "0.5.0"
+version = "0.5.4"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/entsp/markdoc"
@@ -13,9 +13,19 @@ path = "src/lib.rs"
 name = "markdoc-pdf"
 path = "src/main.rs"
 
+[features]
+# Off by default. The renderer brings its own font-matching and parsing
+# stack, and a consumer that never writes a diagram should not pay for it
+# in build time or binary size. The released binary is built with it on --
+# see the release workflow -- because the content repository does write
+# them.
+default = []
+mermaid = ["dep:markdoc-mermaid"]
+
 [dependencies]
 markdoc    = { path = "../markdoc" }
 flux-types = { path = "../flux-types" }
+markdoc-mermaid = { path = "../markdoc-mermaid", optional = true }
 
 # PDF / layout stack — these used to be `*.workspace = true` against
 # the markdoc workspace. Now standalone: pin the same versions

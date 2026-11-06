@@ -388,6 +388,27 @@ impl CalloutStyles {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct PageLayoutStyle {
+    /// Number of text columns on each body page (1 = default full-width column).
+    pub columns: u8,
+    /// Horizontal gap between columns, in points.
+    pub gap: f32,
+    /// Headings at this level and above span all columns (1 = H1 only).
+    pub span_heading_through: u8,
+}
+
+impl Default for PageLayoutStyle {
+    fn default() -> Self {
+        Self {
+            columns: 1,
+            gap: 20.0,
+            span_heading_through: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Style {
     /// Schema-version stamp; reserved for future incompatible bumps.
     pub schema_version: u32,
@@ -397,13 +418,22 @@ pub struct Style {
     pub page_height: f32,
     pub margin_x: f32,
     pub margin_y: f32,
+    /// Multi-column body layout (1 = single column, the default).
+    pub page_layout: PageLayoutStyle,
     /// When the rendered document ends on an odd page, append one page so
     /// the physical total is even. Intended for duplex (double-sided)
     /// printing, where each new document should begin on the front of a
     /// fresh sheet. The padding page carries the running header / footer
     /// (and watermark) like any other page but has no body content, and it
     /// is counted in the `{total}` page-of total. Off by default.
+    /// Ignored when [`pad_to_multiple`] is greater than 1.
     pub pad_to_even: bool,
+    /// Append blank pages (header / footer / watermark only) until the
+    /// physical page count is a multiple of this value. `0` or `1` leaves
+    /// the count unchanged. `4` is the booklet / saddle-stitch case (four
+    /// pages per folded sheet). Counts toward `{total}`. When set, it
+    /// supersedes [`pad_to_even`].
+    pub pad_to_multiple: u32,
 
     // ── Body text ─────────────────────────────────────────────────────
     pub body_font_size: f32,
@@ -582,7 +612,9 @@ impl Default for Style {
             page_height: 842.0, // A4 — real page size now that we paginate
             margin_x: 72.0,
             margin_y: 72.0,
+            page_layout: PageLayoutStyle::default(),
             pad_to_even: false,
+            pad_to_multiple: 0,
             text_align: TextAlign::default(),
             body_font_size: 11.0,
             body_line_height: 1.5,
@@ -809,7 +841,12 @@ pub struct CoverPageStyle {
     pub logo_position: LogoPosition,
     /// Optional hero image (e.g. a product photo) drawn below the cover
     /// metadata — a second image slot so a cover can show both a brand
-    /// logo (above the title) and a hero image.
+    /// logo (above the title) and a hero image. `id` / `src` are templates
+    /// (`{title}` / any frontmatter var). Prefer `id` for an asset-library
+    /// GUID (`{coverImage}`); `src` still accepts a filename such as
+    /// `{title}.png`. Unlike the logo, the hero fills the cover column
+    /// width and keeps the source aspect ratio; `width` / `height` on the
+    /// spec are ignored.
     pub hero: Option<LogoSpec>,
     /// Gap above the hero image.
     pub hero_gap: f32,
@@ -1503,8 +1540,14 @@ pub struct HeaderFooterSlots {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LogoSpec {
+    /// Asset-library GUID (file stem), same contract as `{% media id="…" /%}`.
+    /// Template-substituted like `src`. Tried before `src`; probes
+    /// `{id}.webp` / `.png` / … then `AssetResolver::resolve_id`.
+    pub id: String,
     /// Asset URI — anything the configured asset resolver understands
-    /// (`file://path`, relative path, `https://…`, `arca://…`).
+    /// (`file://path`, relative path, `https://…`, `arca://…`). A bare
+    /// GUID with no extension is treated as an `id`. Cover-page `src` is
+    /// a template (`{title}`, `{coverImage}`, …).
     pub src: String,
     pub width: f32,
     pub height: f32,
@@ -1517,6 +1560,7 @@ pub struct LogoSpec {
 impl Default for LogoSpec {
     fn default() -> Self {
         Self {
+            id: String::new(),
             src: String::new(),
             width: 0.0,
             height: 0.0,
@@ -1611,6 +1655,18 @@ impl Style {
     pub fn from_toml_file(path: impl AsRef<std::path::Path>) -> Result<Self, StyleLoadError> {
         let text = std::fs::read_to_string(path).map_err(StyleLoadError::Io)?;
         Self::from_toml_str(&text).map_err(StyleLoadError::Toml)
+    }
+
+    /// Page-count multiple used for trailing blank pages. `pad_to_multiple`
+    /// wins when it is greater than 1; otherwise `pad_to_even` means 2.
+    pub fn padding_multiple(&self) -> usize {
+        if self.pad_to_multiple > 1 {
+            self.pad_to_multiple as usize
+        } else if self.pad_to_even {
+            2
+        } else {
+            0
+        }
     }
 }
 
@@ -1745,5 +1801,20 @@ badge_fill = [223, 227, 232]
             s.callout_styles.for_kind("unknown").background,
             s.callout_styles.note.background
         );
+    }
+
+    #[test]
+    fn coverpage_hero_deserializes_without_explicit_size() {
+        let toml = r#"
+[coverpage.hero]
+id = "{coverImage}"
+src = "{title}.png"
+"#;
+        let s = Style::from_toml_str(toml).unwrap();
+        let hero = s.coverpage.hero.expect("hero slot");
+        assert_eq!(hero.id, "{coverImage}");
+        assert_eq!(hero.src, "{title}.png");
+        assert_eq!(hero.width, 0.0);
+        assert_eq!(hero.height, 0.0);
     }
 }

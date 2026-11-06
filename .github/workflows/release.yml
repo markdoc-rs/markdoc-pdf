@@ -6,8 +6,8 @@
 # attaches the theme catalogue alongside so writers can grab a
 # one-stop bundle.
 #
-# Like CI, each job checks out the sibling crates (`markdoc`,
-# `flux-types`) next to `markdoc-pdf` so the relative `path = "../…"`
+# Like CI, each job checks out the sibling crates (`markdoc`, `flux-types`,
+# `markdoc-mermaid`) next to `markdoc-pdf` so the relative `path = "../…"`
 # dependencies resolve.
 
 name: Release
@@ -56,11 +56,26 @@ jobs:
           repository: ${{ github.repository_owner }}/markdoc
           path: markdoc
 
+      # Owner hardcoded, unlike the siblings above. flux-types has not moved
+      # to the markdoc-rs org, so `github.repository_owner` resolves it to
+      # `markdoc-rs/flux-types`, which does not exist -- and a missing repo and
+      # a private one are the same 404 from the API, so the failure reads as
+      # "Not Found" with nothing to say which.
       - name: Check out sibling — flux-types
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/flux-types
+          repository: EntSP/flux-types
           path: flux-types
+
+      # Needed even though `mermaid` is off by default: cargo resolves a path
+      # dependency's location while reading the manifest, before it decides
+      # which features are on, so an absent `../markdoc-mermaid` fails the
+      # build outright rather than being skipped.
+      - name: Check out sibling — markdoc-mermaid
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/markdoc-mermaid
+          path: markdoc-mermaid
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

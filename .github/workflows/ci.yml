@@ -1,15 +1,16 @@
 # CI for markdoc-pdf
 #
-# Runs fmt, clippy, tests and a release build on every push and PR
-# against `main`. The crate depends on sibling crates `markdoc` and
-# `flux-types` via relative paths (`path = "../markdoc"`), so each
-# job checks out all three repos side-by-side under a parent dir
+# Runs fmt, clippy, tests and a release build on every push and PR against
+# `main`.
+#
+# The crate depends on `markdoc`, `flux-types` and `markdoc-mermaid` through
+# relative paths (`path = "../markdoc"`), and those are separate repositories,
+# so each job checks all three out side-by-side under the workspace root
 # before running cargo from inside `markdoc-pdf/`.
 #
-# Sibling repos are assumed to live in the same GitHub owner as this
-# repo (the `${{ github.repository_owner }}` substitution). Override
-# the owner per-environment by editing the `repository:` lines if
-# you fork into a different org.
+# Those siblings are taken from this repo's own owner (the
+# `${{ github.repository_owner }}` substitution) with one exception:
+# flux-types, which is still under a different org. See the note on its step.
 
 name: CI
 
@@ -43,11 +44,26 @@ jobs:
           repository: ${{ github.repository_owner }}/markdoc
           path: markdoc
 
+      # Owner hardcoded, unlike the siblings above. flux-types has not moved
+      # to the markdoc-rs org, so `github.repository_owner` resolves it to
+      # `markdoc-rs/flux-types`, which does not exist -- and a missing repo and
+      # a private one are the same 404 from the API, so the failure reads as
+      # "Not Found" with nothing to say which.
       - name: Check out sibling — flux-types
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/flux-types
+          repository: EntSP/flux-types
           path: flux-types
+
+      # Needed even though `mermaid` is off by default: cargo resolves a path
+      # dependency's location while reading the manifest, before it decides
+      # which features are on, so an absent `../markdoc-mermaid` fails the
+      # build outright rather than being skipped.
+      - name: Check out sibling — markdoc-mermaid
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/markdoc-mermaid
+          path: markdoc-mermaid
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

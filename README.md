@@ -95,8 +95,8 @@ Public modules:
 - **Layout features**: hyphenation (embedded en-US dictionary,
   swappable per language), per-page footnote pools, automatic
   Figure N / Table N numbering, table of contents, list of figures,
-  list of tables, cover page, watermarks, and even-page padding
-  (`pad_to_even`) for duplex (double-sided) printing.
+  list of tables, cover page, watermarks, and trailing-page padding
+  (`pad_to_even` / `pad_to_multiple`) for duplex or booklet printing.
 - **Cross-document references**: see [`CROSS_DOC.md`](CROSS_DOC.md).
   Intra-document refs become PDF `GoTo` annotations; cross-doc
   refs are expected to be rewritten upstream by Adeptus before they
@@ -105,6 +105,46 @@ Public modules:
 
 For the current state against the in-flight Flux spec PR, see
 [`FLUX_COMPATIBILITY.md`](FLUX_COMPATIBILITY.md).
+
+## Mermaid diagrams
+
+A ```` ```mermaid ```` fence is drawn as a diagram rather than printed as
+code — a decision tree in a troubleshooting document comes out as the tree.
+It is **off by default**, behind the `mermaid` feature:
+
+```sh
+cargo build --release --features mermaid
+```
+
+Without the feature nothing breaks: the fence falls back to an ordinary
+syntax-highlighted code block, so an author sees the source rather than a
+gap. That is also the failure mode to watch for — a release built without
+`--features mermaid` renders every document successfully and silently, and
+the first person to notice is a reader holding a PDF full of `flowchart TD`.
+The release workflow asserts against it.
+
+Node labels can come from the document instead of the diagram: an
+identifier matching a cross-reference anchor is labelled with that
+heading's text, so renaming a step redraws the diagram. See
+[markdoc-mermaid](../markdoc-mermaid), which is the engine; this crate only
+rasterises what it returns.
+
+Three constraints come from `usvg`, which parses the SVG before krilla
+writes it, and all three are why the diagram is requested unthemed and
+unlinked:
+
+- it does not implement CSS custom properties, so a `var(--x, #0F172A)`
+  fallback resolves to **black**, not to the fallback colour;
+- it has no concept of a hyperlink and flattens `<a href>` into a plain
+  group, so diagram boxes cannot be clickable. Labels carry the section
+  number instead, which is the useful affordance on paper;
+- `usvg::Options::default()` carries an **empty font database** and text is
+  resolved at parse time, so every `<text>` is dropped while the shapes
+  still draw. A diagram of correctly-placed empty boxes is this bug.
+
+A diagram taller than the text area is scaled to fit the page, and a scale
+below 60% prints a warning: the paginator drops an oversized block without
+a word, so the alternative is a diagram that is simply absent.
 
 ## Themes
 
@@ -131,8 +171,18 @@ full knob inventory.
 ## Installation
 
 See [`INSTALL.md`](INSTALL.md) — covers `cargo install`, manual
-binary copy, Windows (PowerShell + WSL), container builds, and CI
-pre-built artefacts.
+binary copy, Windows (PowerShell + WSL), container builds, and the
+pre-built release binaries (Linux x86-64 / ARM64, Windows x86-64 /
+ARM64; built by `.forgejo/workflows/release.yml` on a tag push).
+
+> **Fonts are a runtime dependency, including for the "static"
+> binaries.** No font is embedded: `src/render/text.rs` names
+> families ("Noto Sans", "Noto Sans Mono", …) and parley resolves
+> them against the host's font database, so a machine with no fonts
+> panics with `NoMatch` instead of producing a PDF. `apk add
+> font-noto` / `apt install fonts-noto-core` covers every
+> Latin-script language. Windows and macOS already ship families in
+> the fallback chain.
 
 Short version on Linux/macOS, assuming `markdoc/`, `flux-types/` and
 `markdoc-pdf/` are checked out side-by-side:
