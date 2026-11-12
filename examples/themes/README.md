@@ -387,6 +387,36 @@ empty label/icon, `label_centered = false`):
 | `table_header_column` | bool | `false` | Treat the first column as row headers (header style + fill + a11y tagging). |
 | `table_space_after` | number (pt) | `12.0` | Vertical gap after a table. |
 
+### Tables from frontmatter
+
+`[frontmatter_tables.<tag>]` — a tag that stands for a table built from a
+list of maps in the document's frontmatter, such as a revision history kept
+as metadata. markdoc-pdf has no such tag of its own; each entry here names
+one. Each `{% <tag> /%}` in the composed document (partials and sections
+included, so the tag may sit in a section and read the root's list) becomes
+a level-2 heading and a table with one row per map, styled as any other
+table. The tag's `title` attribute replaces the heading, and `title=""`
+drops it. When the list is absent or holds no map the tag is removed,
+heading and all. A tag no entry names renders as Markdoc renders it: a
+self-closing one, nothing.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `key` | string | required | The frontmatter field the rows come from. An item that is not a map is skipped. |
+| `heading` | optional string | unset (no heading) | The heading above the table. |
+| `columns` | array of `{ field, header }` | required | The columns, left to right: the key each cell is read from in a map of the list (absent, or not text: an empty cell) and the column's header. With none, the tag is removed. |
+
+```toml
+[frontmatter_tables.document-history]
+key = "documentHistory"
+heading = "Document history"
+columns = [
+  { field = "version", header = "Version" },
+  { field = "date", header = "Date" },
+  { field = "description", header = "Description" },
+]
+```
+
 ### Footnotes
 
 `[footnote]` — per-page footnote pool.
@@ -476,7 +506,7 @@ Used by `logo_left`/`logo_center`/`logo_right`, `[coverpage.logo]`,
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `…id` | string (template) | `""` | Asset-library GUID (file stem), same as `{% media id="…" /%}`. Tried before `src`. |
-| `…src` | string (template) | `""` | Asset URI (`file://`, relative path, `https://`, `arca://`). A bare GUID with no extension is treated as an `id`. Cover-page values are templates. |
+| `…src` | string (template) | `""` | Asset URI (`file://`, relative path, `https://`, or a scheme a library caller's resolver handles). A bare GUID with no extension is treated as an `id`. Cover-page values are templates. |
 | `…width` | number (pt) | `0.0` | Display width. Required for logos; ignored for `[coverpage.hero]` (fills the cover column, keeps aspect ratio). |
 | `…height` | number (pt) | `0.0` | Display height. Required for logos; ignored for `[coverpage.hero]`. |
 | `…gap` | number (pt) | `6.0` | Gap between logo and slot text (LEFT/RIGHT header/footer slots only). |

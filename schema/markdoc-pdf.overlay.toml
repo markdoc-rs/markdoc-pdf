@@ -1,0 +1,60 @@
+# markdoc-pdf's own schema: an overlay on markdoc's built-in bundle
+# (markdoc::ext::bundle), compiled into the binary and applied before any
+# `--schema` file. It declares what only this renderer lays out, and how it
+# reads a document when no corpus says otherwise.
+#
+# Upstream Markdoc renders a tag only when the config declares it, and passes
+# on only the attributes the schema declares (plus `class` and `id`); an
+# undeclared tag renders its children and nothing else. So every tag and
+# attribute the renderer reads, beyond markdoc's bundle, is declared here.
+# A corpus overlay given with `--schema` is applied after this file and wins
+# wherever it says something else.
+
+# How a document is read. A corpus states the same in its own `[parse]` and
+# `[render]` tables, which then win key by key. The renderer always reads the
+# frontmatter as YAML, whatever these say: its metadata, the `sections`
+# manifest and the document history come from it.
+[parse]
+# Indented lines stay lists, fences and tags (upstream never makes code of
+# indentation; with this off they would be paragraph text).
+allow_indentation = true
+# `<!-- ... -->` comments stay out of the page.
+allow_comments = true
+# A byte-order mark before the first line is not text (a heading after one
+# would otherwise be a paragraph).
+strip_bom = true
+frontmatter = "yaml"
+
+[render]
+# Curly quotes, dashes and ellipses in the printed text. markdown-it's
+# typographer also turns (c), (tm), (r) and +- into their symbols.
+typographer = true
+
+[tags.toc]
+description = "Where the table of contents goes in a book: front matter before it, the body after it (markdoc-pdf)"
+self_closing = true
+inline = false
+
+[tags.footnote]
+description = "Footnote text, numbered and set at the foot of the page (markdoc-pdf)"
+inline = true
+
+[nodes.fence.attributes.align]
+type = ["String"]
+description = "Horizontal placement of the code block: left (default) | center | right"
+one_of = ["left", "center", "right"]
+
+[nodes.image.attributes.size]
+type = ["String"]
+description = "Display size preset (small | medium | large | table | icon) or a length"
+one_of = ["small", "medium", "large", "table", "icon"]
+pattern = '^\d+(\.\d+)?(px|%|pt|em|rem)$'
+
+[nodes.image.attributes.width]
+type = ["Number", "String"]
+description = "Explicit width: a fraction <= 1 of the column, a length, or an NN% string"
+
+[nodes.image.attributes.side]
+type = ["String"]
+description = "Inside a float: the side the image floats to"
+one_of = ["left", "right"]

@@ -1,9 +1,10 @@
 [package]
 name = "markdoc-pdf"
-version = "0.5.4"
+version = "0.10.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/entsp/markdoc"
+description = "Render Markdoc documents to PDF, as a CLI or a library"
+repository = "https://github.com/markdoc-rs/markdoc-pdf"
 
 [lib]
 name = "markdoc_pdf"
@@ -14,18 +15,16 @@ name = "markdoc-pdf"
 path = "src/main.rs"
 
 [features]
-# Off by default. The renderer brings its own font-matching and parsing
-# stack, and a consumer that never writes a diagram should not pay for it
-# in build time or binary size. The released binary is built with it on --
-# see the release workflow -- because the content repository does write
-# them.
-default = []
+# On by default, because the content repository writes diagrams and a build
+# without the feature prints every ```mermaid fence as its source, without
+# a word. A consumer that never writes one can leave out the engine and its
+# font-matching and parsing stack with `--no-default-features`.
+default = ["mermaid"]
 mermaid = ["dep:markdoc-mermaid"]
 
 [dependencies]
-markdoc    = { path = "../markdoc" }
-flux-types = { path = "../flux-types" }
-markdoc-mermaid = { path = "../markdoc-mermaid", optional = true }
+markdoc    = "0.1.0"
+markdoc-mermaid = { version = "0.1.0", optional = true }
 
 # PDF / layout stack — these used to be `*.workspace = true` against
 # the markdoc workspace. Now standalone: pin the same versions
@@ -34,7 +33,6 @@ krilla     = "0.8"
 krilla-svg = "0.8"
 parley     = "0.11"
 usvg       = "0.47"   # pinned to match krilla-svg 0.8's internal usvg
-image      = "0.25"
 
 serde      = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

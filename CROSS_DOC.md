@@ -10,12 +10,15 @@ format.
 See {% tagref doc="productx-manual" id="commissioning" /%} for details.
 ```
 
-- `doc` — the target's stable Adeptus document id (matches its
+- `doc` — the target's stable document id (matches its
   frontmatter `id:` field). Independent of file paths and URLs, so
   it survives reorganising the source tree.
 - `id` — the anchor inside that document (`{% tag id="..." /%}` on a
   heading or as a mid-paragraph marker).
-- Primary shorthand also works: `{% tagref doc="productx-manual" "commissioning" /%}`.
+- Primary shorthand also works, written first as Markdoc requires:
+  `{% tagref "commissioning" doc="productx-manual" /%}`. After an attribute
+  (`{% tagref doc="productx-manual" "commissioning" /%}`) it is a syntax
+  error, and the reference renders as nothing.
 
 The source stays output-agnostic. The writer never embeds a URL or a
 file path into a cross-doc reference.
@@ -24,16 +27,16 @@ file path into a cross-doc reference.
 
 | Format | Resolution path |
 |--------|----------------|
-| Web frontend | Adeptus serves a curated/filtered view of the document via GraphQL. The reader app calls Adeptus to resolve `(doc, id)` into a frontend URL when the user clicks. |
-| Mobile app | Same model — reader app fetches Adeptus's index and resolves on click. |
+| Web frontend | The publishing platform serves a curated/filtered view of the document. The reader app asks the platform to resolve `(doc, id)` into a frontend URL when the user clicks. |
+| Mobile app | Same model — reader app fetches the platform's index and resolves on click. |
 | In-software / in-app | Same model — reader (the embedding app) resolves at runtime. |
 
-PDFs can't resolve at runtime. So Adeptus has to do the resolution
-**before** Scriptor renders.
+PDFs can't resolve at runtime. So the publishing platform has to do the
+resolution **before** the PDF is rendered.
 
-## Adeptus rewrites — for PDF
+## The platform rewrites — for PDF
 
-When a render request reaches Adeptus, it walks every `{% tagref %}`
+When a render request reaches the publishing platform, it walks every `{% tagref %}`
 in the source whose `doc=` attribute is set and rewrites it into one
 of two forms — the choice depends on the delivery mode the request
 asked for.
@@ -48,15 +51,15 @@ URL annotation:
 INPUT
     See {% tagref doc="productx-manual" id="commissioning" /%} for details.
 
-OUTPUT (handed to Scriptor)
+OUTPUT (handed to the renderer)
     See [the commissioning section of Product X Manual](https://docs.example.com/productx/manual#commissioning) for details.
 ```
 
-Scriptor sees a plain Markdown link; markdoc-pdf already handles it
+The renderer sees a plain Markdown link; markdoc-pdf already handles it
 as an external `LinkAction` annotation. No special code path.
 
 The display label (`the commissioning section of Product X Manual`)
-comes from Adeptus's index — it knows the target doc's title and the
+comes from the platform's index — it knows the target doc's title and the
 heading text at that anchor, so it can produce a human-readable
 phrase. Falls back to `<doc-id>: <anchor-id>` if the resolution
 fails.
@@ -65,7 +68,7 @@ fails.
 
 For multi-doc PDF bundles — e.g. a customer delivery package that
 includes a manual plus its referenced safety notes in one file.
-Adeptus produces a single concatenated source where every doc has
+The platform produces a single concatenated source where every doc has
 been prefixed-namespaced, and rewrites cross-refs to the
 intra-document form:
 
@@ -76,39 +79,40 @@ INPUT (from doc A)
 INPUT (from doc B, which is "productx-safety")
     # Emergency stop {% tag id="emergency-stop" /%}
 
-OUTPUT (single concatenated source handed to Scriptor)
+OUTPUT (single concatenated source handed to the renderer)
     See {% tagref id="bundle:productx-safety__emergency-stop" /%}.
     …
     # Emergency stop {% tag id="bundle:productx-safety__emergency-stop" /%}
 ```
 
-The `bundle:<doc-id>__<anchor-id>` convention is opaque to Scriptor —
+The `bundle:<doc-id>__<anchor-id>` convention is opaque to the renderer —
 it just sees an intra-document anchor reference and resolves it via
 the existing anchor map at emit time. Any prefix scheme works; pick
 one and stick with it.
 
-## Scriptor's contract
+## The renderer's contract
 
-Scriptor expects to receive source where **`doc=` attributes have
-already been removed** by Adeptus's rewrite step. Specifically:
+The service that calls markdoc-pdf expects to receive source where
+**`doc=` attributes have already been removed** by the platform's rewrite
+step. Specifically:
 
-- Every `{% tagref %}` Scriptor sees has either an `id="..."` /
+- Every `{% tagref %}` the renderer sees has either an `id="..."` /
   primary anchor name (intra-document) OR is replaced by an
   external `[text](url)` Markdown link.
-- Scriptor passes the source to `markdoc-pdf` unchanged; markdoc-pdf
+- The calling service passes the source to `markdoc-pdf` unchanged; markdoc-pdf
   produces internal `GoTo` annotations for intra-doc references and
   external `LinkAction` annotations for URLs.
 - markdoc-pdf has no knowledge of cross-doc resolution.
 
 If a `{% tagref doc="..." /%}` slips through unrewritten (e.g. local
-preview, Adeptus rewrite skipped), markdoc-pdf renders it as a
+preview, platform rewrite skipped), markdoc-pdf renders it as a
 visibly-degraded placeholder `[<doc-id>#<anchor-id>]` with no link
 annotation — loud enough that the author spots the unresolved
 reference in a draft preview without anything failing.
 
 ## Local-iteration behaviour today
 
-With no Adeptus in the loop:
+With no publishing platform in the loop:
 
 ```
 SOURCE
@@ -131,7 +135,7 @@ See [the setup section](../other-manual.mdoc#setup).
 ```
 
 But that ties the source to the file layout, so for anything that
-will eventually go through Adeptus, prefer `{% tagref doc=... id=... /%}`.
+will eventually go through a publishing platform, prefer `{% tagref doc=... id=... /%}`.
 
 ## Summary diagram
 
@@ -143,16 +147,16 @@ will eventually go through Adeptus, prefer `{% tagref doc=... id=... /%}`.
                               │
         ┌─────────────────────┼─────────────────────┐
         ▼                     ▼                     ▼
-   web/mobile/in-app      Adeptus rewrite      local preview
-        │                  (PDF only)           (no Adeptus)
+   web/mobile/in-app     platform rewrite      local preview
+        │                  (PDF only)          (no platform)
         ▼                     │                     │
    reader app calls        ┌──┴──┐                  ▼
-   Adeptus on click        ▼     ▼              renders as
+   platform on click       ▼     ▼              renders as
                        Mode A  Mode B           [X#Y] placeholder
                           │     │
                           ▼     ▼
                     ┌──────────────────┐
-                    │ Scriptor receives│
+                    │ renderer receives│
                     │ rewritten source │
                     │  • [text](url)   │
                     │    (Mode A)      │

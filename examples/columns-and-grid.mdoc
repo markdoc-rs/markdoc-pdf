@@ -4,13 +4,13 @@ title: Columns and grids
 
 # Columns and grids
 
-`\{% columns %}` places its children in equal-width columns, side by side.
+`{% columns %}` places its children in equal-width columns, side by side.
 Each column is either a list item (`*`) or a blank-line-separated block. The
 `gap` attribute (points) sets the spacing, and `widths` (e.g. `widths="2 1"`
 or `widths=[2, 1]`) makes them uneven. `align="center"` centres each column's
 content, and `background="#…"` paints a panel behind the row. For a set of
 cells that should *reflow* into as many columns as fit — wrapping into rows —
-reach for `\{% grid %}` (at the end). Render with `--assets-root examples` so
+reach for `{% grid %}` (at the end). Render with `--assets-root examples` so
 the swatch images resolve.
 
 ## Two images — list form
@@ -44,7 +44,7 @@ size within the column.
 
 ## Captions — above, below, and coloured
 
-Put a `\{% caption %}` and its image in one list item, separated by a blank
+Put a `{% caption %}` and its image in one list item, separated by a blank
 line, so they stay distinct blocks. `position="below"` moves the caption
 under the image, and `color="#…"` tints it (or set `caption_color` in the
 style to colour every caption):
@@ -66,7 +66,7 @@ with commentary on either side. Each lane is its own stream, so the two
 sides are independent (they can differ), and — like any columns — they keep
 their width for the whole row rather than reflowing below the image. For
 text that wraps down *one* side of an image and then widens beneath it, use
-`\{% float %}` instead.
+`{% float %}` instead.
 
 {% columns widths="2 1 2" gap=18 %}
 * Left-hand text runs down this side of the figure. It is its own lane,
@@ -101,7 +101,7 @@ and it reads as a captioned figure:
 
 ## Responsive grid
 
-`\{% grid %}` takes the same cells as `\{% columns %}` but *reflows* them into
+`{% grid %}` takes the same cells as `{% columns %}` but *reflows* them into
 as many equal columns as fit at `min` points wide (default 120), wrapping into
 rows — the print analogue of CSS `repeat(auto-fill, minmax(min, 1fr))`. `gap`
 spaces both columns and rows; `align` and `background` work as above. A short

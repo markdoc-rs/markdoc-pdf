@@ -48,7 +48,7 @@ use crate::assets::AssetResolver;
 
 use block::LayoutCtx;
 pub use external_tagrefs::ExternalTagref;
-pub use style::{Style, StyleLoadError};
+pub use style::{FrontmatterColumn, FrontmatterTable, Style, StyleLoadError};
 
 /// Caller-supplied context that the renderer can interpolate into
 /// header/footer template strings and surface as PDF document metadata.
@@ -202,6 +202,12 @@ pub fn render_pdf_with(
     assets: &dyn AssetResolver,
     ctx: &RenderContext,
 ) -> Result<Vec<u8>, RenderError> {
+    // Tag aliases are already resolved: markdoc's schema bundle renders an
+    // alias under its canonical tag's name, so `{% notice %}` arrives here
+    // as `callout` and the `match`es below need no arm of their own for it.
+    // Keeping that in the schema rather than here means a renderer cannot
+    // forget it.
+
     let rewritten = if ctx.external_tagrefs.is_empty() {
         None
     } else {

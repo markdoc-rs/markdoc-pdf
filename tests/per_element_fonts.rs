@@ -24,15 +24,13 @@
 //! is portable (a document with no style renders fine everywhere);
 //! only the family *names* differ. See `two_installed_families`.
 
-use markdoc::types::Config;
-use markdoc::{parse, transform};
 use markdoc_pdf::assets::NullAssetResolver;
+use markdoc_pdf::pipeline;
 use markdoc_pdf::render::{RenderContext, Style, render_pdf_with};
 
 /// Render `source` with `style_toml` and return the PDF bytes.
 fn render(source: &str, style_toml: &str) -> Vec<u8> {
-    let doc = parse(source, None).expect("test source should parse");
-    let rendered = transform(&doc, &Config::default()).expect("test source should transform");
+    let rendered = pipeline::render_tree(source).expect("test source should transform");
     let style = Style::from_toml_str(style_toml).expect("test style should parse");
     render_pdf_with(
         &rendered,

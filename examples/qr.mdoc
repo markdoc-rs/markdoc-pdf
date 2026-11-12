@@ -5,7 +5,7 @@ documentNumber: 600123
 
 # QR codes
 
-`\{% qr /%}` renders a QR code from `value` — a URL, a document number, or any
+`{% qr /%}` renders a QR code from `value` — a URL, a document number, or any
 text. `size` (points, default 72) sets the square's side, `ecl` the
 error-correction level (`low` | `medium` | `quartile` | `high`), `color` /
 `background` the module / field colours, `quiet_zone` the margin (in modules,
@@ -20,7 +20,7 @@ here becomes the code:
 
 {% qr value=$markdoc.frontmatter.documentNumber size=64 /%}
 
-For a code alone on the final page, precede it with `\{% pagebreak /%}`.
+For a code alone on the final page, precede it with `{% pagebreak /%}`.
 
 ## A URL, centered and robust
 

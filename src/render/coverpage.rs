@@ -62,7 +62,7 @@ pub fn build_coverpage_blocks(
     // above the title or between title and subtitle without
     // duplicating the asset-resolver code. `src` is a template so
     // covers can pick a product image from frontmatter, e.g.
-    // `{title}.png` → `MiR250 Manual.png`.
+    // `{title}.png` → `Bot250 Manual.png`.
     let logo_block = coverpage.logo.as_ref().and_then(|logo| {
         build_cover_image(
             logo,
@@ -628,32 +628,32 @@ mod tests {
     #[test]
     fn hero_src_substitutes_title() {
         let ctx = RenderContext {
-            title: "MiR250 Manual".into(),
+            title: "Bot250 Manual".into(),
             ..Default::default()
         };
-        assert_eq!(substitute("{title}.png", &ctx, ""), "MiR250 Manual.png");
+        assert_eq!(substitute("{title}.png", &ctx, ""), "Bot250 Manual.png");
     }
 
     #[test]
     fn hero_src_leaves_static_path_unchanged() {
         let ctx = RenderContext::default();
         assert_eq!(
-            substitute("MiR_Logo=Positive.svg", &ctx, ""),
-            "MiR_Logo=Positive.svg"
+            substitute("Acme_Logo=Positive.svg", &ctx, ""),
+            "Acme_Logo=Positive.svg"
         );
     }
 
     #[test]
     fn hero_src_substitutes_frontmatter_vars() {
         let mut vars = HashMap::new();
-        vars.insert("productImage".into(), "MiR250 Hook Manual".into());
+        vars.insert("productImage".into(), "Bot250 Hook Manual".into());
         let ctx = RenderContext {
             vars,
             ..Default::default()
         };
         assert_eq!(
             substitute("{productImage}.png", &ctx, ""),
-            "MiR250 Hook Manual.png"
+            "Bot250 Hook Manual.png"
         );
     }
 
@@ -669,7 +669,7 @@ mod tests {
     #[test]
     fn bare_guid_looks_like_asset_id() {
         assert!(looks_like_asset_id("09f3a884-2e34-4821-81ef-2935a85a7477"));
-        assert!(!looks_like_asset_id("MiR250 Manual.png"));
+        assert!(!looks_like_asset_id("Bot250 Manual.png"));
         assert!(!looks_like_asset_id("images/hero.webp"));
     }
 
@@ -712,10 +712,10 @@ mod tests {
         let base = std::env::temp_dir().join("mdpdf-cover-src-fallback-test");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(base.join("MiR250 Manual.png"), b"\x89PNG-bytes").unwrap();
+        std::fs::write(base.join("Bot250 Manual.png"), b"\x89PNG-bytes").unwrap();
 
         let ctx = RenderContext {
-            title: "MiR250 Manual".into(),
+            title: "Bot250 Manual".into(),
             ..Default::default()
         };
         let logo = LogoSpec {

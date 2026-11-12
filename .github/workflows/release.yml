@@ -1,81 +1,174 @@
 # Release workflow for markdoc-pdf
 #
-# Triggered by pushing a SemVer tag without a `v` prefix (e.g. `0.2.0`
-# or `0.2.0-rc1`). Builds release binaries for Linux x86_64, macOS
-# aarch64 and Windows x86_64, uploads them as a GitHub release, and
-# attaches the theme catalogue alongside so writers can grab a
-# one-stop bundle.
+# Builds release binaries for Linux x86_64 (static musl, and glibc) and
+# aarch64 (static musl), macOS aarch64 and x86_64, and Windows x86_64 and
+# aarch64, publishes the crate to crates.io, uploads the binaries as a GitHub
+# release, and attaches the theme catalogue alongside so writers can grab
+# a one-stop bundle.
 #
-# Like CI, each job checks out the sibling crates (`markdoc`, `flux-types`,
-# `markdoc-mermaid`) next to `markdoc-pdf` so the relative `path = "../…"`
-# dependencies resolve.
+# Every asset gets a `.sha256` beside it and a GitHub build-provenance
+# attestation, which ties it to the commit and the workflow run that built
+# it. GitHub keeps the attestation, and the release carries a copy beside
+# the asset, <asset>.sigstore.json. Check a download against either:
+#
+#   gh attestation verify markdoc-pdf-linux-x86_64 --repo markdoc-rs/markdoc-pdf
+#   gh attestation verify markdoc-pdf-linux-x86_64 --repo markdoc-rs/markdoc-pdf \
+#       --bundle markdoc-pdf-linux-x86_64.sigstore.json
+#
+# ## How a release happens
+#
+# Cargo.toml's version is the release. A push to main that changes
+# Cargo.toml runs this workflow, and when no tag names that version yet it
+# checks the commit, builds every binary, publishes the crate to crates.io,
+# and then creates the GitHub release, and the tag with it, on that commit.
+# A version a tag already names does nothing; one older than the newest
+# tag fails the run (.github/scripts/release_version.py says why). "Run
+# workflow" does the same on demand, to retry a release that failed. A
+# version with a pre-release part, 0.2.0-rc.1, makes a pre-release, so
+# `releases/latest` stays on the last full release.
+#
+# crates.io takes the crate through trusted publishing, so no token is
+# stored here: the crate's settings on crates.io name this repository and
+# release.yml, and can name the `release` environment the publish job runs
+# in, as allowed to publish it. Those settings exist only once the
+# crate does, so its first version on crates.io is published by hand; a
+# run that finds its version there already skips that step.
 
 name: Release
 
 on:
   push:
-    tags:
-      - "[0-9]+.[0-9]+.[0-9]+" # stable:      0.2.0
-      - "[0-9]+.[0-9]+.[0-9]+-*" # pre-release: 0.2.0-rc1, 0.2.0-beta.3
+    branches: [main]
+    paths: [Cargo.toml]
+  workflow_dispatch:
 
 permissions:
-  contents: write # needed for the release-creating step
+  contents: read
+
+# One release at a time: two runs deciding at once could both find the
+# version untagged.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ────────────────────────────────────────────────────────────────────
+  # Whether this push is a release, and of which version. Everything below
+  # runs only when it is.
+  # ────────────────────────────────────────────────────────────────────
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.version.outputs.release }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Only main releases
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::${GITHUB_REF} is not main, and only main is released." >&2
+          exit 1
+
+      - name: Check out markdoc-pdf
+        uses: actions/checkout@v5
+        with:
+          path: markdoc-pdf
+
+      - name: Cargo.toml's version, and whether a tag names it yet
+        id: version
+        run: python3 -I markdoc-pdf/.github/scripts/release_version.py markdoc-pdf
+
+  # ────────────────────────────────────────────────────────────────────
+  # Nothing is published until this passes. Same check.sh ci.yml runs, so
+  # a release cannot hold a build the ordinary gate would have rejected.
+  # ────────────────────────────────────────────────────────────────────
+  check:
+    name: Check
+    needs: version
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out markdoc-pdf
+        uses: actions/checkout@v5
+        with:
+          path: markdoc-pdf
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # As ci.yml installs them: fontconfig's headers, and two font families
+      # the per-element font tests can tell apart.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev fonts-liberation
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: markdoc-pdf
+
+      - name: check.sh
+        run: bash markdoc-pdf/.github/scripts/check.sh markdoc-pdf
+
   build:
     name: Build ${{ matrix.target }}
+    needs: check
     runs-on: ${{ matrix.os }}
+    # Signing and recording the attestation. Publishing is the job after.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # glibc, linked against the system's own fontconfig, so it reads
+          # that system's font configuration as the system does. Pinned
+          # rather than ubuntu-latest: the runner's glibc (2.39) is the
+          # oldest this binary runs on, and INSTALL.md says so.
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact: markdoc-pdf
-            asset: markdoc-pdf-linux-x86_64
+            asset: markdoc-pdf-linux-x86_64-glibc
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: markdoc-pdf
             asset: markdoc-pdf-macos-aarch64
+          # Cross-compiled from the Apple Silicon runner, which Xcode's
+          # universal SDK makes ordinary. Intel Macs are still in use, and an
+          # aarch64-only release leaves them with no renderer at all.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: markdoc-pdf
+            asset: markdoc-pdf-macos-x86_64
+          # The C runtime linked in, so a PC without the Visual C++
+          # Redistributable can still start it.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: markdoc-pdf.exe
             asset: markdoc-pdf-windows-x86_64.exe
+            rustflags: -C target-feature=+crt-static
+          # Windows on ARM64, built natively on GitHub's ARM runner. ring
+          # needs clang for this target and psm MSVC's ARM64 tools; its image
+          # has both.
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact: markdoc-pdf.exe
+            asset: markdoc-pdf-windows-aarch64.exe
+            rustflags: -C target-feature=+crt-static
     steps:
       - name: Check out markdoc-pdf
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: markdoc-pdf
-
-      - name: Check out sibling — markdoc
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/markdoc
-          path: markdoc
-
-      # Owner hardcoded, unlike the siblings above. flux-types has not moved
-      # to the markdoc-rs org, so `github.repository_owner` resolves it to
-      # `markdoc-rs/flux-types`, which does not exist -- and a missing repo and
-      # a private one are the same 404 from the API, so the failure reads as
-      # "Not Found" with nothing to say which.
-      - name: Check out sibling — flux-types
-        uses: actions/checkout@v4
-        with:
-          repository: EntSP/flux-types
-          path: flux-types
-
-      # Needed even though `mermaid` is off by default: cargo resolves a path
-      # dependency's location while reading the manifest, before it decides
-      # which features are on, so an absent `../markdoc-mermaid` fails the
-      # build outright rather than being skipped.
-      - name: Check out sibling — markdoc-mermaid
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/markdoc-mermaid
-          path: markdoc-mermaid
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -94,9 +187,14 @@ jobs:
           workspaces: markdoc-pdf
           key: release-${{ matrix.target }}
 
+      # `mermaid` is a default feature, and it is named here as well. A
+      # release without it prints every diagram as its source, without a
+      # word, and the first person to notice is a reader holding the PDF.
       - name: Build release
         working-directory: markdoc-pdf
-        run: cargo build --release --target ${{ matrix.target }} --bin markdoc-pdf
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --target ${{ matrix.target }} --bin markdoc-pdf --features mermaid
 
       - name: Stage artifact
         shell: bash
@@ -105,18 +203,168 @@ jobs:
           mkdir -p ../staging
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} ../staging/${{ matrix.asset }}
 
+      # What `rustflags` is for. An import of vcruntime140.dll would mean
+      # writers need the Visual C++ Redistributable after all, and nothing
+      # on the runner would notice: it has it installed.
+      - name: It needs no Visual C++ runtime
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -eu
+          asset="staging/${{ matrix.asset }}"
+          if grep -a -q -i 'vcruntime140' "$asset"; then
+            echo "::error::$asset imports the Visual C++ runtime (vcruntime140.dll)" >&2
+            exit 1
+          fi
+          echo "$asset: $(wc -c < "$asset") bytes, the C runtime linked in"
+
+      # Signed for this workflow run, so a download can be traced to the
+      # commit and the workflow that built it. GitHub keeps the attestation;
+      # the release carries a copy too, beside the asset, where it can be
+      # seen and checked without asking GitHub.
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: staging/${{ matrix.asset }}
+
+      - name: Keep the attestation with the asset
+        shell: bash
+        run: cp "${{ steps.attest.outputs.bundle-path }}" "staging/${{ matrix.asset }}.sigstore.json"
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.asset }}
-          path: staging/${{ matrix.asset }}
+          path: |
+            staging/${{ matrix.asset }}
+            staging/${{ matrix.asset }}.sigstore.json
+          if-no-files-found: error
+
+  # ────────────────────────────────────────────────────────────────────
+  # Linux, static: musl, with fontconfig and everything it links built in,
+  # so it runs on any distribution whatever its libc, an older CI image or
+  # Alpine included. The x86-64 one takes the plain `linux-x86_64` name
+  # because that is the asset `tw` downloads, and a CI image is where an
+  # older glibc turns up. The ARM64 one is built natively, on GitHub's ARM
+  # runner.
+  #
+  # Built in Alpine, not on the Ubuntu runner: a static musl binary needs
+  # fontconfig, freetype, expat and the rest as static musl archives, which
+  # Alpine packages and Ubuntu does not. By `docker run` rather than as the
+  # job's container, because the runner refuses to run a JavaScript action
+  # (checkout, upload-artifact) inside an Alpine container anywhere but x64.
+  # ────────────────────────────────────────────────────────────────────
+  build-musl:
+    name: Build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    # Signing and recording the attestation. Publishing is the job after.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: markdoc-pdf-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: markdoc-pdf-linux-aarch64
+    steps:
+      - name: Check out markdoc-pdf
+        uses: actions/checkout@v5
+        with:
+          path: markdoc-pdf
+
+      # PKG_CONFIG_ALL_STATIC has pkg-config name the static archives, and
+      # the libraries fontconfig itself links, instead of the shared ones.
+      # `mermaid` is named for the reason the other builds give. The image
+      # is multi-arch, so each runner gets the one for its own architecture.
+      - name: Build release, in Alpine
+        run: |
+          docker run --rm -v "$PWD/markdoc-pdf:/src" -w /src \
+              -e PKG_CONFIG_ALL_STATIC=1 rust:1-alpine sh -euxc '
+            apk add --no-cache musl-dev pkgconf fontconfig-dev fontconfig-static \
+                freetype-static expat-static libpng-static zlib-static \
+                brotli-static bzip2-static
+            cargo build --release --target ${{ matrix.target }} \
+                --bin markdoc-pdf --features mermaid
+          '
+
+      # What this build is for: it needs nothing from the system it lands
+      # on. A NEEDED entry or an interpreter would mean it does.
+      - name: It is static
+        working-directory: markdoc-pdf
+        run: |
+          set -eu
+          bin=target/${{ matrix.target }}/release/markdoc-pdf
+          if readelf -d "$bin" | grep NEEDED; then
+            echo "::error::the static build links shared libraries" >&2; exit 1
+          fi
+          if readelf -l "$bin" | grep -i interpreter; then
+            echo "::error::the static build asks for a dynamic loader" >&2; exit 1
+          fi
+
+      # And it runs on this Ubuntu runner, a glibc system it was not built
+      # on, finding fonts through the fontconfig built into it. A render
+      # that finds none panics with NoMatch instead of writing a PDF.
+      - name: It renders
+        working-directory: markdoc-pdf
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y fonts-dejavu-core
+          ./target/${{ matrix.target }}/release/markdoc-pdf \
+              --input examples/rich.mdoc \
+              --output "$RUNNER_TEMP/rich.pdf" \
+              --style examples/themes/letter.style.toml \
+              --assets-root examples
+          test -s "$RUNNER_TEMP/rich.pdf"
+
+      - name: Stage artifact
+        working-directory: markdoc-pdf
+        run: |
+          mkdir -p ../staging
+          cp target/${{ matrix.target }}/release/markdoc-pdf ../staging/${{ matrix.asset }}
+
+      # Signed for this workflow run, so a download can be traced to the
+      # commit and the workflow that built it. GitHub keeps the attestation;
+      # the release carries a copy too, beside the asset, where it can be
+      # seen and checked without asking GitHub.
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: staging/${{ matrix.asset }}
+
+      - name: Keep the attestation with the asset
+        shell: bash
+        run: cp "${{ steps.attest.outputs.bundle-path }}" "staging/${{ matrix.asset }}.sigstore.json"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            staging/${{ matrix.asset }}
+            staging/${{ matrix.asset }}.sigstore.json
           if-no-files-found: error
 
   themes:
     name: Bundle theme catalogue
+    needs: check
     runs-on: ubuntu-latest
+    # Signing and recording the attestation. Publishing is the job after.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Bundle themes
         run: |
@@ -124,19 +372,52 @@ jobs:
           tar czf staging/themes.tar.gz -C examples themes
           (cd examples && zip -r ../staging/themes.zip themes)
 
+      # Signed for this workflow run, so a download can be traced to the
+      # commit and the workflow that built it. GitHub keeps the attestation;
+      # the release carries a copy too, beside the asset, where it can be
+      # seen and checked without asking GitHub.
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: staging/themes.*
+
+      - name: Keep the attestation with the asset
+        shell: bash
+        run: cp "${{ steps.attest.outputs.bundle-path }}" "staging/themes.sigstore.json"
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: themes
           path: staging/themes.*
           if-no-files-found: error
 
+  # ────────────────────────────────────────────────────────────────────
+  # Only once every platform has built: crates.io first, since a version
+  # published there cannot be taken back and a GitHub release can be
+  # edited, and the release last, all of it at once, so `releases/latest`
+  # never holds one with a platform missing.
+  # ────────────────────────────────────────────────────────────────────
   publish:
-    name: Publish GitHub release
+    name: Publish
     runs-on: ubuntu-latest
-    needs: [build, themes]
+    needs: [version, build, build-musl, themes]
+    # As crates.io's trusted publishing guide recommends: an environment
+    # the trusted publisher can name, and that the repository's settings
+    # can limit to main or put behind a reviewer.
+    environment: release
+    # The release and the tag it creates, and crates.io trusted publishing.
+    permissions:
+      contents: write
+      id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Check out markdoc-pdf
+        uses: actions/checkout@v5
+        with:
+          path: markdoc-pdf
+
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
           merge-multiple: true
@@ -144,9 +425,73 @@ jobs:
       - name: Show what we collected
         run: ls -lh artifacts
 
-      - name: Create or update release
-        uses: softprops/action-gh-release@v2
+      # Every asset gets a `<asset>.sha256` beside it: `tw` verifies a
+      # download against it and refuses one it cannot check. Computed here
+      # rather than in each platform's build, so the digests are of the
+      # bytes that are actually uploaded.
+      #
+      # No pipeline. `sha256sum "$f" | sed ...` is how the other workflows
+      # in this family write these, because there the file's path is not
+      # the asset's name -- and `set -e` does not fire on a non-final
+      # command in a pipeline. A sha256sum that failed would leave an EMPTY
+      # .sha256 and report success, and the release would ship a checksum
+      # nobody could use. Here the working directory is the asset
+      # directory, so sha256sum already writes exactly `<hex>  <asset>`.
+      - name: Checksums
+        working-directory: artifacts
+        run: |
+          set -eu
+          for f in *; do
+            # A directory, or anything download-artifact left that is not
+            # an asset. Without this the loop above would have hashed it.
+            [ -f "$f" ] || continue
+            # A checksum, or an attestation bundle: neither is an asset.
+            case "$f" in *.sha256 | *.sigstore.json) continue ;; esac
+            sha256sum "$f" > "$f.sha256"
+          done
+          ls -lh
+          # The step checks its own work. Publishing a checksum that does
+          # not check out is worse than publishing none: a consumer that
+          # verifies would refuse the release, and one that does not would
+          # never find out.
+          sha256sum -c ./*.sha256
+
+      # A run that published the crate and then failed can be re-run
+      # without publishing it twice, which crates.io would refuse.
+      - name: Is this version on crates.io?
+        id: crates-io
+        run: python3 -I markdoc-pdf/.github/scripts/release_version.py --on-crates-io markdoc-pdf
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # cargo publish builds what it uploads before uploading it, and that
+      # build needs fontconfig's headers as every other Linux build does.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev
+
+      # A token for this job only, issued against the trusted publisher
+      # set up in the crate's settings on crates.io, and revoked after.
+      - name: Authenticate to crates.io
+        id: auth
+        if: steps.crates-io.outputs.published == 'false'
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish to crates.io
+        if: steps.crates-io.outputs.published == 'false'
+        working-directory: markdoc-pdf
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked
+
+      - name: Create the release, and its tag
+        uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ needs.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
           files: artifacts/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+          prerelease: ${{ needs.version.outputs.prerelease }}

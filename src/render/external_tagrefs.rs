@@ -88,7 +88,7 @@ fn rewrite(
 }
 
 fn link_node(url: &str) -> RenderableTreeNode {
-    let mut attributes = HashMap::new();
+    let mut attributes = markdoc::IndexMap::new();
     attributes.insert("href".to_string(), Scalar::String(url.to_string()));
     attributes.insert("title".to_string(), Scalar::String(url.to_string()));
     RenderableTreeNode::Tag(Box::new(Tag {

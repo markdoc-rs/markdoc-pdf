@@ -17,9 +17,11 @@ stripe on alternating body rows.
 
 ## Per-table overrides
 
-To style one table differently, wrap a normal pipe table in a `table` tag
-and pass attributes (the sections below show the source). Anything you
-don't set is inherited from the style file, so overrides stay minimal.
+To style one table differently, write it as a `table` tag (its cells as
+`*` items, its rows separated by `---`) and pass attributes on the tag (the
+sections below show the source). A pipe table wrapped in the tag does not
+take them: Markdoc leaves such a table as it is. Anything you don't set is
+inherited from the style file, so overrides stay minimal.
 Supported attributes: `borders` (`grid` / `horizontal` / `none`),
 `border_color`, `edge_color`, `header_background`, `stripe` (a colour or
 `none`), `column_weights`, and `cell_padding`.
@@ -27,32 +29,52 @@ Supported attributes: `borders` (`grid` / `horizontal` / `none`),
 ### Horizontal rules, striping switched off
 
 {% table borders="horizontal" stripe="none" %}
-| Setting | Value   |
-|---------|---------|
-| Speed   | 1.2 m/s |
-| Payload | 250 kg  |
-| Battery | 48 V    |
+* Setting
+* Value
+---
+* Speed
+* 1.2 m/s
+---
+* Payload
+* 250 kg
+---
+* Battery
+* 48 V
 {% /table %}
 
 ### Borderless, with a custom header fill
 
 {% table borders="none" header_background="#d8e4f0" %}
-| Phase  | Owner    |
-|--------|----------|
-| Design | A. Smith |
-| Build  | B. Jones |
-| Verify | C. Lee   |
+* Phase
+* Owner
+---
+* Design
+* A. Smith
+---
+* Build
+* B. Jones
+---
+* Verify
+* C. Lee
 {% /table %}
 
 ### A custom stripe and border colour
 
 {% table stripe="#fdeaea" border_color="#e3b7b7" %}
-| Risk     | Severity |
-|----------|----------|
-| Overheat | High     |
-| Stall    | Medium   |
-| Drift    | Low      |
-| Jitter   | Low      |
+* Risk
+* Severity
+---
+* Overheat
+* High
+---
+* Stall
+* Medium
+---
+* Drift
+* Low
+---
+* Jitter
+* Low
 {% /table %}
 
 ### Column weights and roomier padding
@@ -60,11 +82,21 @@ Supported attributes: `borders` (`grid` / `horizontal` / `none`),
 A wide first column (weights `3 1 1`) with extra cell padding.
 
 {% table column_weights="3 1 1" cell_padding="9" %}
-| Description                 | Qty | Unit |
-|-----------------------------|-----|------|
-| Mounting bracket, stainless | 4   | pcs  |
-| Hex bolt M6×20              | 16  | pcs  |
-| Cable gland                 | 2   | pcs  |
+* Description
+* Qty
+* Unit
+---
+* Mounting bracket, stainless
+* 4
+* pcs
+---
+* Hex bolt M6×20
+* 16
+* pcs
+---
+* Cable gland
+* 2
+* pcs
 {% /table %}
 
 ### Booktabs edges (dark top/bottom rules)
@@ -72,23 +104,34 @@ A wide first column (weights `3 1 1`) with extra cell padding.
 `edge_color` paints the outer top/bottom rules darker than the inner ones.
 
 {% table borders="horizontal" edge_color="#202020" stripe="none" %}
-| Metric     | Before | After |
-|------------|--------|-------|
-| Latency    | 120 ms | 80 ms |
-| Throughput | 1.0k   | 1.6k  |
+* Metric
+* Before
+* After
+---
+* Latency
+* 120 ms
+* 80 ms
+---
+* Throughput
+* 1.0k
+* 1.6k
 {% /table %}
 
 ### A header column (row headers)
 
 `header_column=true` makes the first column row headers — bold, shaded,
 and tagged for accessibility — instead of (or as well as) the top row.
-Paired with a blank header row (`| | |`, which is dropped), it gives the
+Paired with no header row (the table starts with `---`), it gives the
 classic key/value metadata table.
 
 {% table header_column=true borders="horizontal" stripe="none" %}
-| | |
-|---------|--------------------------|
-| Date    | 2026-05-20               |
-| Version | 3.9.0                    |
-| Author  | Mobile Industrial Robots |
+---
+* Date
+* 2026-05-20
+---
+* Version
+* 3.9.0
+---
+* Author
+* Acme Industrial Robotics
 {% /table %}

@@ -16,13 +16,16 @@ documentHistory:
 # Document history
 
 A document's revision history lives in the `documentHistory` frontmatter — a
-list of `{ version, date, description }` entries. Drop `\{% document-history /%}`
+list of `{ version, date, description }` entries. Drop `{% document-history /%}`
 wherever the table should appear; the renderer builds it from the frontmatter,
 so the data is authored once and every document's history table looks the same.
+The tag, the list it reads, its heading and its columns are named by the style,
+`document-history.style.toml` beside this file; render with that style, as
+without it the tag renders nothing.
 
 {% document-history /%}
 
-The heading defaults to *Document history*. Pass `title=` to change it, or
+The heading is the style's, *Document history*. Pass `title=` to change it, or
 `title=""` for the table on its own:
 
 {% document-history title="Revision log" /%}

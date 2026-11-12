@@ -4,12 +4,12 @@ title: Colour swatches and indicator bars
 
 # Colour swatches
 
-`\{% swatch /%}` draws a block colour bar that fills the available width — the
-block sibling of the inline `\{% color %}`. Fill it solid with `color`, or
+`{% swatch /%}` draws a block colour bar that fills the available width — the
+block sibling of the inline `{% color %}`. Fill it solid with `color`, or
 with a linear gradient via `gradient` (`"[Ndeg,] stop, stop, …"` — stops are
 evenly spaced unless one carries an `NN%` position, and `transparent` is
 allowed). `height` (points, default 6) and `radius` (default 2) size it. For a
-small colour dot *inline*, reach for `\{% chip /%}` (below).
+small colour dot *inline*, reach for `{% chip /%}` (below).
 
 ## Solid and gradient bars
 
@@ -31,8 +31,8 @@ A fade to transparent at 25 % (`#ff0000, transparent 25%`):
 
 ## Inline chips
 
-`\{% chip /%}` drops a small colour dot into running text — the inline sibling
-of `\{% swatch %}`. Fill it with `color`; `shape="square"` swaps the dot for a
+`{% chip /%}` drops a small colour dot into running text — the inline sibling
+of `{% swatch %}`. Fill it with `color`; `shape="square"` swaps the dot for a
 square. It flows with the words: {% chip color="#ff0000" /%} stopped,
 {% chip color="#00a000" /%} ready, {% chip color="#00b0b0" /%} driving, and a
 {% chip color="#fd7e14" shape="square" /%} square variant.
@@ -43,8 +43,8 @@ full bar would be too heavy.
 
 ## Indicator key — swatch inside a grid
 
-Put a `\{% swatch /%}` above a bold title and a short grey description in each
-`\{% grid %}` cell, and the reflowing grid becomes a status / indicator key.
+Put a `{% swatch /%}` above a bold title and a short grey description in each
+`{% grid %}` cell, and the reflowing grid becomes a status / indicator key.
 Solid colours and gradients (a "wavering" light shown as a gradient) sit side
 by side. Render with `--assets-root examples` for consistency with the other
 examples (no assets are needed here):

@@ -181,17 +181,11 @@ fn retract_orphan_trailing(current: &mut Vec<Block>, work: &mut VecDeque<Block>,
     }
 }
 
-/// Rebuilds the footnote pool for a set of note numbers: returns the height it
-/// needs and the blocks that make it up.
-///
-/// Named rather than written out at the two call sites below, which is also
-/// what keeps `clippy::type_complexity` quiet.
-type PoolFor<'a> = &'a mut dyn FnMut(&[u32]) -> (f32, Vec<Block>);
-
 /// Recompute body height + footnote pool after a retract changed `current`.
+#[allow(clippy::type_complexity)]
 fn refresh_after_retract(
     current: &[Block],
-    pool_for: PoolFor<'_>,
+    pool_for: &mut dyn FnMut(&[u32]) -> (f32, Vec<Block>),
     body_height: &mut f32,
     pool_height: &mut f32,
     pool_blocks: &mut Vec<Block>,

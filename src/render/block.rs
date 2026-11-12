@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use krilla::color::rgb;
 use krilla::image::Image as KrillaImage;
+use markdoc::IndexMap;
 use markdoc::types::{RenderableTreeNode, Scalar, Tag};
 use parley::{FontContext, Layout, LayoutContext};
 use usvg::Tree as SvgTree;
@@ -1347,8 +1348,9 @@ fn layout_node(
     };
 
     match tag.name.as_str() {
-        // Document / generic structural wrappers: recurse children.
-        "div" => layout_children(&tag.children, x, width, ctx),
+        // Document / generic structural wrappers: recurse children. The
+        // document itself is upstream's `<article>`.
+        "article" | "div" => layout_children(&tag.children, x, width, ctx),
 
         "p" => layout_paragraph(tag, x, width, ctx),
         h @ ("h1" | "h2" | "h3" | "h4" | "h5" | "h6") => {
@@ -1389,6 +1391,13 @@ fn layout_node(
 
         // `{% swatch %}` — a block colour bar / chip (solid or gradient).
         "swatch" => layout_swatch(tag, x, width, ctx),
+
+        // `{% lightindicators /%}` — status-light legend (swatch grid).
+        "lightindicators" => layout_lightindicators(x, width, ctx),
+
+        // `{% noParaSpaceBox %}` — collapse inter-paragraph gaps (address /
+        // contact stacks in copyright).
+        "noParaSpaceBox" => layout_no_para_space_box(tag, x, width, ctx),
 
         // `{% imagegrid %}` / `{% gridimage %}` — illustrated side-by-side
         // cells on a light grey panel (Locomotion, etc.).
@@ -1434,6 +1443,35 @@ fn layout_children(
     let mut out = Vec::new();
     let mut i = 0;
     while i < children.len() {
+        // Text and inline tags standing directly among blocks: upstream
+        // Markdoc wraps no paragraph around an interpolation or an inline tag
+        // on a line of its own (`{% $productName %}`, `{% tag "x" /%}`). Set
+        // the run as the paragraph the old parser made of it; a run that
+        // prints nothing (a null, a blank) is dropped, as before.
+        if is_inline_child(&children[i]) {
+            let end = children[i..]
+                .iter()
+                .position(|c| !is_inline_child(c))
+                .map_or(children.len(), |n| i + n);
+            let run = &children[i..end];
+            let prints = run.iter().any(|c| match c {
+                RenderableTreeNode::Tag(_) => true,
+                RenderableTreeNode::Scalar(value) => {
+                    super::inline::scalar_text(value).is_some_and(|t| !t.trim().is_empty())
+                }
+            });
+            if prints {
+                let paragraph = Tag {
+                    name: "p".to_string(),
+                    attributes: IndexMap::new(),
+                    children: run.to_vec(),
+                };
+                out.extend(layout_paragraph(&paragraph, x, width, ctx));
+            }
+            i = end;
+            continue;
+        }
+
         // Detect `{% caption %}...{% /caption %}` directly followed by
         // either a `<table>` or an `<img>` / `<media>` (possibly
         // wrapped in a `<p>`). Render the caption as a small text
@@ -1700,12 +1738,14 @@ fn find_caption_tag(node: &RenderableTreeNode) -> Option<&Tag> {
                     RenderableTreeNode::Tag(inner) => {
                         if inner.name == "caption" && found.is_none() {
                             found = Some(inner.as_ref());
-                        } else if matches!(inner.name.as_str(), "softbreak" | "hardbreak" | "br") {
+                        } else if matches!(inner.name.as_str(), "hardbreak" | "br") {
                             continue;
                         } else {
                             return None;
                         }
                     }
+                    // A soft break is the text " " (upstream's softbreak).
+                    RenderableTreeNode::Scalar(Scalar::String(s)) if s.trim().is_empty() => {}
                     RenderableTreeNode::Scalar(_) => return None,
                 }
             }
@@ -2658,12 +2698,42 @@ fn extract_code_text(children: &[RenderableTreeNode]) -> String {
     let mut s = String::new();
     for child in children {
         match child {
-            RenderableTreeNode::Scalar(Scalar::String(text)) => s.push_str(text),
+            RenderableTreeNode::Scalar(value) => {
+                if let Some(text) = super::inline::scalar_text(value) {
+                    s.push_str(&text);
+                }
+            }
             RenderableTreeNode::Tag(t) => s.push_str(&extract_code_text(&t.children)),
-            _ => {}
         }
     }
     s
+}
+
+/// True for inline content: text, and the tags the inline collector lays out
+/// (formatting, links, anchors and references, chips, colour spans,
+/// footnotes). Not images: a lone image is laid out as a figure.
+fn is_inline_child(node: &RenderableTreeNode) -> bool {
+    match node {
+        RenderableTreeNode::Scalar(_) => true,
+        RenderableTreeNode::Tag(t) => matches!(
+            t.name.as_str(),
+            "strong"
+                | "em"
+                | "s"
+                | "strikethrough"
+                | "code"
+                | "br"
+                | "hardbreak"
+                | "a"
+                | "footnote"
+                | "tagref"
+                | "tag"
+                | "chip"
+                | "color"
+                | "c"
+                | "ref"
+        ),
+    }
 }
 
 /// True for tag names that are laid out as block-level constructs.
@@ -2707,7 +2777,7 @@ fn wrap_inline_runs_in_paragraphs(children: &[RenderableTreeNode]) -> Vec<Render
         }
         let p = Tag {
             name: "p".to_string(),
-            attributes: std::collections::HashMap::new(),
+            attributes: IndexMap::new(),
             children: std::mem::take(run),
         };
         out.push(RenderableTreeNode::Tag(Box::new(p)));
@@ -3006,7 +3076,7 @@ struct TableOverride {
 }
 
 impl TableOverride {
-    fn from_attrs(attrs: &std::collections::HashMap<String, Scalar>) -> Self {
+    fn from_attrs(attrs: &IndexMap<String, Scalar>) -> Self {
         use super::inline::parse_css_color;
         use super::style::TableBorders;
         let color = |key: &str| match attrs.get(key) {
@@ -3063,10 +3133,12 @@ impl TableOverride {
     }
 }
 
-/// Find the node that actually holds the table rows. A pipe table is a
-/// `Tag("table")` whose children are `<thead>`/`<tbody>`/`<tr>`. When the
-/// author wraps a pipe table in `{% table … %}` to style it, the real
-/// `<table>` sits one level down as a child, so descend into it.
+/// Find the node that actually holds the table rows. A table is a
+/// `Tag("table")` whose children are `<thead>`/`<tbody>`/`<tr>`. Markdoc's
+/// `{% table %}` renders as that table (with the tag's attributes when it
+/// holds a list table; a pipe table wrapped in the tag keeps none of them).
+/// A table tag that renders as an element of its own, around the real
+/// `<table>`, is tolerated: descend into it.
 fn table_rows_source(tag: &Tag) -> &Tag {
     let has_rows = tag.children.iter().any(|c| {
         matches!(c, RenderableTreeNode::Tag(t)
@@ -3117,7 +3189,7 @@ fn columns_from_children(tag: &Tag) -> Vec<Vec<RenderableTreeNode>> {
 }
 
 /// A points value from a layout tag's numeric-or-string attribute.
-fn attr_points(attrs: &std::collections::HashMap<String, Scalar>, key: &str, default: f32) -> f32 {
+fn attr_points(attrs: &IndexMap<String, Scalar>, key: &str, default: f32) -> f32 {
     attrs
         .get(key)
         .and_then(|s| match s {
@@ -3130,7 +3202,7 @@ fn attr_points(attrs: &std::collections::HashMap<String, Scalar>, key: &str, def
 }
 
 /// Relative column widths from a `widths="2 1"` / `widths=[2, 1]` attribute.
-fn parse_widths(attrs: &std::collections::HashMap<String, Scalar>) -> Option<Vec<f32>> {
+fn parse_widths(attrs: &IndexMap<String, Scalar>) -> Option<Vec<f32>> {
     match attrs.get("widths") {
         Some(Scalar::Array(items)) => Some(
             items
@@ -3152,9 +3224,7 @@ fn parse_widths(attrs: &std::collections::HashMap<String, Scalar>) -> Option<Vec
 }
 
 /// `align="left|center|right"` on a layout tag → parley alignment.
-fn parse_layout_align(
-    attrs: &std::collections::HashMap<String, Scalar>,
-) -> Option<parley::layout::Alignment> {
+fn parse_layout_align(attrs: &IndexMap<String, Scalar>) -> Option<parley::layout::Alignment> {
     use parley::layout::Alignment;
     match attrs.get("align") {
         Some(Scalar::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
@@ -3168,9 +3238,7 @@ fn parse_layout_align(
 }
 
 /// `background="#f9f9f9"` on a layout tag → panel fill colour.
-fn parse_layout_background(
-    attrs: &std::collections::HashMap<String, Scalar>,
-) -> Option<rgb::Color> {
+fn parse_layout_background(attrs: &IndexMap<String, Scalar>) -> Option<rgb::Color> {
     match attrs.get("background") {
         Some(Scalar::String(s)) => super::inline::parse_css_color(s),
         _ => None,
@@ -3202,14 +3270,14 @@ fn layout_cells_row(
         .map(|blocks| {
             RenderableTreeNode::Tag(Box::new(Tag {
                 name: "td".to_string(),
-                attributes: std::collections::HashMap::new(),
+                attributes: IndexMap::new(),
                 children: blocks,
             }))
         })
         .collect();
     let tr = RenderableTreeNode::Tag(Box::new(Tag {
         name: "tr".to_string(),
-        attributes: std::collections::HashMap::new(),
+        attributes: IndexMap::new(),
         children: tds,
     }));
     let weights_str = weights
@@ -3222,7 +3290,7 @@ fn layout_cells_row(
         })
         .unwrap_or_else(|| vec!["1"; n].join(" "));
 
-    let mut table_attrs = std::collections::HashMap::new();
+    let mut table_attrs = IndexMap::new();
     table_attrs.insert("borders".to_string(), Scalar::String("none".to_string()));
     table_attrs.insert("column_weights".to_string(), Scalar::String(weights_str));
     table_attrs.insert(
@@ -3553,7 +3621,7 @@ fn parse_gradient(s: &str) -> Option<SwatchFill> {
 
 /// The fill for a `{% swatch %}` from its attributes (`gradient` wins over
 /// `color`).
-fn parse_swatch_fill(attrs: &std::collections::HashMap<String, Scalar>) -> Option<SwatchFill> {
+fn parse_swatch_fill(attrs: &IndexMap<String, Scalar>) -> Option<SwatchFill> {
     if let Some(Scalar::String(g)) = attrs.get("gradient") {
         return parse_gradient(g);
     }
@@ -3631,32 +3699,131 @@ fn layout_swatch(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<
     }
 }
 
-/// Light grey panel behind `{% imagegrid %}` — matches `.imagegrid {
-/// background-color: #f9f9f9 }` in `public/globals.css`.
-const IMAGE_GRID_BG: &str = "#f9f9f9";
-
-/// Column gutter inside an image grid — matches `.imagegrid { gap: 10px }`.
-const IMAGE_GRID_GAP: f32 = 10.0;
-
-/// String attribute helper for gridimage / imagegrid layout.
-fn attr_string<'a>(
-    attrs: &'a std::collections::HashMap<String, Scalar>,
-    key: &str,
-) -> Option<&'a str> {
-    match attrs.get(key) {
-        Some(Scalar::String(s)) if !s.trim().is_empty() => Some(s.as_str()),
-        _ => None,
-    }
+/// One status-light entry — mirrors `components/LightIndicators.tsx` and
+/// the `.light-indicator-bar.*` fills in `public/globals.css`.
+struct LightIndicatorSpec {
+    title: &'static str,
+    description: &'static str,
+    /// Solid CSS colour, or `None` when `gradient` is set.
+    color: Option<&'static str>,
+    /// Swatch `gradient="…"` string (CSS-compatible stops), or `None`.
+    gradient: Option<&'static str>,
 }
 
+/// Status lights shown by `{% lightindicators /%}`. Colours / gradients
+/// match the web component's CSS classes.
+const LIGHT_INDICATORS: &[LightIndicatorSpec] = &[
+    LightIndicatorSpec {
+        title: "Red",
+        description: "Emergency stop or Protective stop",
+        color: Some("#ff0000"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Green",
+        description: "Ready for job",
+        color: Some("#00fa00"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Cyan",
+        description: "Drives to destination",
+        color: Some("#00fafa"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Purple",
+        description: "Goal/Path blocked",
+        color: Some("#f900f9"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Wavering white",
+        description: "Planning path",
+        color: None,
+        // CSS: linear-gradient(to right, white, black, white)
+        gradient: Some("90deg, white, black, white"),
+    },
+    LightIndicatorSpec {
+        title: "Orange",
+        description: "Mission paused",
+        color: Some("#fd7e14"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Wavering orange",
+        description: "Startup signal before PC is active",
+        color: None,
+        // CSS: linear-gradient(to right, #fd7e14, white, #fd7e14)
+        gradient: Some("90deg, #fd7e14, white, #fd7e14"),
+    },
+    LightIndicatorSpec {
+        title: "Fading orange",
+        description: "Shutting down robot",
+        color: None,
+        // CSS: linear-gradient(to bottom, #fd7e14, #fff3e0)
+        gradient: Some("180deg, #fd7e14, #fff3e0"),
+    },
+    LightIndicatorSpec {
+        title: "Blinking orange",
+        description: "Relative move, ignoring obstacles",
+        color: None,
+        // CSS uses repeating-linear-gradient; approximate one pulse period.
+        gradient: Some("90deg, transparent, #fd7e14 15%, #fd7e14 35%, transparent 50%"),
+    },
+    LightIndicatorSpec {
+        title: "Wavering purple and orange",
+        description: "General error",
+        color: None,
+        // CSS: linear-gradient(to right, #fd7e14, #a435f0, #fd7e14)
+        gradient: Some("90deg, #fd7e14, #a435f0, #fd7e14"),
+    },
+    LightIndicatorSpec {
+        title: "Blue",
+        description: "Manual drive",
+        color: Some("#0000ff"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Wavering blue",
+        description: "Mapping",
+        color: None,
+        // CSS: linear-gradient(to right, #0000ff, white, #0000ff)
+        gradient: Some("90deg, #0000ff, white, #0000ff"),
+    },
+    LightIndicatorSpec {
+        title: "Battery percentage",
+        description: "Charging at charging station",
+        color: None,
+        // CSS: linear-gradient(to right, #ff0000, transparent 25%)
+        gradient: Some("90deg, #ff0000, transparent 25%"),
+    },
+    LightIndicatorSpec {
+        title: "Wavering cyan",
+        description: "Waiting for a fleet resource or for another robot to move",
+        color: None,
+        // CSS: linear-gradient(to right, #00fafa, white, #00fafa)
+        gradient: Some("90deg, #00fafa, white, #00fafa"),
+    },
+];
+
+/// Description text colour — matches `.light-indicator-description` in
+/// `public/globals.css` (`#6c757d`).
+const LIGHT_INDICATOR_DESC_COLOR: &str = "#6c757d";
+
+/// Bar height / radius — matches `.light-indicator-bar` (5px, 2px radius).
+const LIGHT_INDICATOR_BAR_HEIGHT: f64 = 5.0;
+const LIGHT_INDICATOR_BAR_RADIUS: f64 = 2.0;
+
+/// Grid metrics — matches `.light-indicator-grid`
+/// (`minmax(150px, 1fr)`, `gap: 1.25rem` ≈ 15pt).
+const LIGHT_INDICATOR_MIN: f64 = 150.0;
+const LIGHT_INDICATOR_GAP: f64 = 15.0;
+
 /// Build a trivial Markdoc render node.
-///
-/// These arrived with the MiR status-light legend and were named for it. The
-/// legend is gone and they are plain node builders, so they carry a name that
-/// says so.
-fn rt_tag(
+fn light_rt_tag(
     name: &str,
-    attrs: std::collections::HashMap<String, Scalar>,
+    attrs: IndexMap<String, Scalar>,
     children: Vec<RenderableTreeNode>,
 ) -> RenderableTreeNode {
     RenderableTreeNode::Tag(Box::new(Tag {
@@ -3666,8 +3833,130 @@ fn rt_tag(
     }))
 }
 
-fn rt_text(s: &str) -> RenderableTreeNode {
+fn light_rt_text(s: &str) -> RenderableTreeNode {
     RenderableTreeNode::Scalar(Scalar::String(s.to_string()))
+}
+
+/// One grid cell: `{% swatch %}` bar + bold title + grey description.
+/// Title and description share one paragraph (hard-break between) so the
+/// gap matches the web's tight `.light-indicator-title` / description stack
+/// rather than two full `paragraph_space_after` gaps.
+fn light_indicator_cell(spec: &LightIndicatorSpec) -> Vec<RenderableTreeNode> {
+    let mut swatch_attrs = IndexMap::new();
+    if let Some(g) = spec.gradient {
+        swatch_attrs.insert("gradient".to_string(), Scalar::String(g.to_string()));
+    } else if let Some(c) = spec.color {
+        swatch_attrs.insert("color".to_string(), Scalar::String(c.to_string()));
+    }
+    swatch_attrs.insert(
+        "height".to_string(),
+        Scalar::Number(LIGHT_INDICATOR_BAR_HEIGHT),
+    );
+    swatch_attrs.insert(
+        "radius".to_string(),
+        Scalar::Number(LIGHT_INDICATOR_BAR_RADIUS),
+    );
+
+    let mut color_attrs = IndexMap::new();
+    color_attrs.insert(
+        "value".to_string(),
+        Scalar::String(LIGHT_INDICATOR_DESC_COLOR.to_string()),
+    );
+
+    let label = light_rt_tag(
+        "p",
+        IndexMap::new(),
+        vec![
+            light_rt_tag("strong", IndexMap::new(), vec![light_rt_text(spec.title)]),
+            light_rt_tag("hardbreak", IndexMap::new(), Vec::new()),
+            light_rt_tag("color", color_attrs, vec![light_rt_text(spec.description)]),
+        ],
+    );
+
+    vec![light_rt_tag("swatch", swatch_attrs, Vec::new()), label]
+}
+
+/// `{% lightindicators /%}` — status-light legend. Expands into a `{% grid %}`
+/// of `{% swatch %}` bars with bold titles and muted descriptions, using the
+/// same colours / gradients as the web `LightIndicators` component.
+fn layout_lightindicators(x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<Block> {
+    let items: Vec<RenderableTreeNode> = LIGHT_INDICATORS
+        .iter()
+        .map(|spec| light_rt_tag("li", IndexMap::new(), light_indicator_cell(spec)))
+        .collect();
+
+    let ul = light_rt_tag("ul", IndexMap::new(), items);
+
+    let mut grid_attrs = IndexMap::new();
+    grid_attrs.insert("min".to_string(), Scalar::Number(LIGHT_INDICATOR_MIN));
+    grid_attrs.insert("gap".to_string(), Scalar::Number(LIGHT_INDICATOR_GAP));
+
+    let grid = Tag {
+        name: "grid".to_string(),
+        attributes: grid_attrs,
+        children: vec![ul],
+    };
+    let mut blocks = layout_grid(&grid, x, width, ctx);
+    // Match `.light-indicator-grid { margin: 1.25rem 0 }` — keep a bit of
+    // breathing room after the legend before the next section prose.
+    if let Some(last) = blocks.last_mut() {
+        last.space_after = LIGHT_INDICATOR_GAP as f32;
+    }
+    blocks
+}
+
+/// Outer margin of `{% noParaSpaceBox %}` — matches `.noParaSpaceBox {
+/// margin: 15px 0 }` in `public/globals.css` (15 CSS px ≈ 11 pt).
+const NO_PARA_SPACE_BOX_MARGIN: f32 = 11.0;
+
+/// `{% noParaSpaceBox %}…{% /noParaSpaceBox %}` — lay children out normally,
+/// then collapse every inter-paragraph `space_after` to zero so address /
+/// contact lines stack as tightly as the web `.noParaSpaceBox p { margin: 0 }`
+/// rule. The box itself keeps a small trailing margin (CSS `15px`).
+fn layout_no_para_space_box(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<Block> {
+    // Skip blank / whitespace-only children so a leading blank line after the
+    // opening tag doesn't leave an empty gap at the top of the stack.
+    let children: Vec<&RenderableTreeNode> = tag
+        .children
+        .iter()
+        .filter(|c| match c {
+            RenderableTreeNode::Tag(t) => !node_text_is_blank(&t.children),
+            RenderableTreeNode::Scalar(Scalar::String(s)) => !s.trim().is_empty(),
+            RenderableTreeNode::Scalar(_) => true,
+        })
+        .collect();
+
+    let mut blocks = Vec::new();
+    for child in children {
+        blocks.extend(layout_node(child, x, width, ctx));
+    }
+    if blocks.is_empty() {
+        return blocks;
+    }
+    let last = blocks.len() - 1;
+    for (i, b) in blocks.iter_mut().enumerate() {
+        b.space_after = if i == last {
+            NO_PARA_SPACE_BOX_MARGIN
+        } else {
+            0.0
+        };
+    }
+    blocks
+}
+
+/// Light grey panel behind `{% imagegrid %}` — matches `.imagegrid {
+/// background-color: #f9f9f9 }` in `public/globals.css`.
+const IMAGE_GRID_BG: &str = "#f9f9f9";
+
+/// Column gutter inside an image grid — matches `.imagegrid { gap: 10px }`.
+const IMAGE_GRID_GAP: f32 = 10.0;
+
+/// String attribute helper for gridimage / imagegrid layout.
+fn attr_string<'a>(attrs: &'a IndexMap<String, Scalar>, key: &str) -> Option<&'a str> {
+    match attrs.get(key) {
+        Some(Scalar::String(s)) if !s.trim().is_empty() => Some(s.as_str()),
+        _ => None,
+    }
 }
 
 /// Expand one `{% gridimage %}` into the column contents: media + bold
@@ -3675,7 +3964,7 @@ fn rt_text(s: &str) -> RenderableTreeNode {
 fn gridimage_cell_nodes(tag: &Tag) -> Vec<RenderableTreeNode> {
     let mut nodes = Vec::new();
 
-    let mut media_attrs = std::collections::HashMap::new();
+    let mut media_attrs = IndexMap::new();
     if let Some(id) = attr_string(&tag.attributes, "id") {
         media_attrs.insert("id".to_string(), Scalar::String(id.to_string()));
     }
@@ -3684,25 +3973,25 @@ fn gridimage_cell_nodes(tag: &Tag) -> Vec<RenderableTreeNode> {
     }
     // Fill the column — the locomotion examples are the main visual.
     media_attrs.insert("size".to_string(), Scalar::String("large".to_string()));
-    nodes.push(rt_tag("media", media_attrs, Vec::new()));
+    nodes.push(light_rt_tag("media", media_attrs, Vec::new()));
 
     if let Some(headline) = attr_string(&tag.attributes, "headline") {
-        nodes.push(rt_tag(
+        nodes.push(light_rt_tag(
             "p",
-            std::collections::HashMap::new(),
-            vec![rt_tag(
+            IndexMap::new(),
+            vec![light_rt_tag(
                 "strong",
-                std::collections::HashMap::new(),
-                vec![rt_text(headline)],
+                IndexMap::new(),
+                vec![light_rt_text(headline)],
             )],
         ));
     }
 
     if let Some(body) = attr_string(&tag.attributes, "bodytext") {
-        nodes.push(rt_tag(
+        nodes.push(light_rt_tag(
             "p",
-            std::collections::HashMap::new(),
-            vec![rt_text(body)],
+            IndexMap::new(),
+            vec![light_rt_text(body)],
         ));
     }
 
@@ -4646,17 +4935,15 @@ fn layout_table(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<B
     // Per-table style overrides from the `{% table … %}` attributes; a
     // plain pipe table has none, so everything inherits the document style.
     let ov = TableOverride::from_attrs(&tag.attributes);
-    // For a plain pipe table the rows are this node's own children; when a
-    // pipe table is wrapped in `{% table … %}` for styling, the real
-    // <table> is a child — descend to wherever the rows actually live.
+    // The rows are this node's own children, or a nested table's (see
+    // `table_rows_source`).
     let rows_tag = table_rows_source(tag);
 
-    // Collect rows from <thead> and <tbody>. pulldown-cmark's pipe-table
-    // form puts cells directly under <thead> (no wrapping <tr>) for the
-    // header, and emits <tr>s as direct children of <table> for body
-    // rows. We tolerate both shapes:
-    //   <table><thead><tr><td/></tr></thead><tbody><tr>…</tr></tbody></table>
-    //   <table><thead><td/><td/></thead><tr/><tr/></table>
+    // Collect rows from <thead> and <tbody>: markdoc makes
+    //   <table><thead><tr><th/></tr></thead><tbody><tr><td/></tr></tbody></table>
+    // of a pipe table and of a `{% table %}` list table alike. Cells
+    // directly under <thead>, and <tr>s directly under <table>, are
+    // tolerated too.
     let mut header_rows: Vec<RowSource<'_>> = Vec::new();
     let mut body_rows: Vec<RowSource<'_>> = Vec::new();
     for child in &rows_tag.children {
@@ -4693,9 +4980,8 @@ fn layout_table(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<B
     if !header_rows.is_empty() && rows_are_blank(&header_rows) {
         header_rows.clear();
     }
-    // Drop wholly-blank body rows. A pipe table wrapped in `{% table %}`
-    // can pick up a spurious empty trailing row from the closing tag; a row
-    // with no content in any cell is never meaningful. (A row with some
+    // Drop wholly-blank body rows: a row with no content in any cell is
+    // never meaningful. (A row with some
     // empty cells but text elsewhere — e.g. a metadata row with a blank
     // value — is kept.)
     body_rows.retain(|r| !r.cells().all(|c| node_text_is_blank(&c.children)));
@@ -4744,19 +5030,12 @@ fn layout_table(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<B
     // Render the first column as row headers (bold + header fill)?
     let header_column = ov.header_column.unwrap_or(ctx.style.table_header_column);
 
-    // Per-column text alignment from CommonMark's `:--`/`--:` delimiter row,
-    // which markdoc stores on the table node's `align` attribute.
-    let column_aligns: Vec<parley::layout::Alignment> = match rows_tag.attributes.get("align") {
-        Some(Scalar::Array(arr)) => arr
-            .iter()
-            .map(|s| match s {
-                Scalar::String(a) if a == "center" => parley::layout::Alignment::Center,
-                Scalar::String(a) if a == "right" => parley::layout::Alignment::End,
-                _ => parley::layout::Alignment::Start,
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
+    // Per-column text alignment from the header row: markdoc puts each
+    // cell's alignment on the cell (`align`), from CommonMark's `:--`/`--:`
+    // delimiter row in a pipe table and from an `{% align="…" %}`
+    // annotation in a list table. A header cell's aligns its whole column; a
+    // body cell's own overrides it for that cell (`cell_align` below).
+    let column_aligns = header_column_aligns(&header_rows, num_cols);
 
     // Rowspan occupancy carries across rows (header → body); each row's
     // layout consumes and ages it.
@@ -4904,9 +5183,11 @@ fn rows_are_blank(rows: &[RowSource<'_>]) -> bool {
 /// non-whitespace text and no image/media tag.
 fn node_text_is_blank(nodes: &[RenderableTreeNode]) -> bool {
     nodes.iter().all(|n| match n {
-        RenderableTreeNode::Scalar(Scalar::String(s)) => s.trim().is_empty(),
-        // Numbers / bools render as visible text.
-        RenderableTreeNode::Scalar(_) => false,
+        // Numbers / bools render as visible text; null and undefined as
+        // nothing.
+        RenderableTreeNode::Scalar(value) => {
+            super::inline::scalar_text(value).is_none_or(|text| text.trim().is_empty())
+        }
         RenderableTreeNode::Tag(t) => {
             !matches!(t.name.as_str(), "img" | "media") && node_text_is_blank(&t.children)
         }
@@ -4914,20 +5195,51 @@ fn node_text_is_blank(nodes: &[RenderableTreeNode]) -> bool {
 }
 
 /// A cell's column span from its `colspan` attribute (set by the list-syntax
-/// `{% colspan=N %}` annotation); at least 1.
+/// `{% colspan=N %}` annotation; markdoc renders it as `colSpan`); at
+/// least 1.
 fn cell_colspan(tag: &Tag) -> usize {
-    match tag.attributes.get("colspan") {
+    cell_span(tag, "colSpan", "colspan")
+}
+
+/// A cell's row span from its `rowspan` attribute (rendered `rowSpan`); at
+/// least 1.
+fn cell_rowspan(tag: &Tag) -> usize {
+    cell_span(tag, "rowSpan", "rowspan")
+}
+
+fn cell_span(tag: &Tag, rendered: &str, written: &str) -> usize {
+    match tag
+        .attributes
+        .get(rendered)
+        .or_else(|| tag.attributes.get(written))
+    {
         Some(Scalar::Number(n)) if *n >= 1.0 => *n as usize,
         _ => 1,
     }
 }
 
-/// A cell's row span from its `rowspan` attribute; at least 1.
-fn cell_rowspan(tag: &Tag) -> usize {
-    match tag.attributes.get("rowspan") {
-        Some(Scalar::Number(n)) if *n >= 1.0 => *n as usize,
-        _ => 1,
+/// The alignment of each of `num_cols` columns, from the first header row's
+/// cells (a spanning cell aligns every column it covers); `Start` where it
+/// says nothing.
+fn header_column_aligns(
+    header_rows: &[RowSource<'_>],
+    num_cols: usize,
+) -> Vec<parley::layout::Alignment> {
+    let mut aligns = vec![parley::layout::Alignment::Start; num_cols];
+    let Some(first) = header_rows.first() else {
+        return aligns;
+    };
+    let mut col = 0usize;
+    for cell in first.cells() {
+        let span = cell_colspan(cell);
+        if let Some(align) = cell_align(cell) {
+            for a in aligns.iter_mut().skip(col).take(span) {
+                *a = align;
+            }
+        }
+        col += span;
     }
+    aligns
 }
 
 /// Table column count under the occupancy model: a `colspan` widens its row,
@@ -5098,7 +5410,11 @@ fn compute_auto_column_widths(
     let mut col_min: Vec<f32> = vec![0.0; num_cols];
     let mut col_max: Vec<f32> = vec![0.0; num_cols];
 
-    for src in header_rows.iter().chain(body_rows.iter()) {
+    let rows = header_rows
+        .iter()
+        .map(|row| (row, true))
+        .chain(body_rows.iter().map(|row| (row, false)));
+    for (src, is_header) in rows {
         let mut col = 0usize;
         for cell_tag in src.cells() {
             if col >= num_cols {
@@ -5108,11 +5424,8 @@ fn compute_auto_column_widths(
             // A spanning cell informs no single column's width — the columns
             // are sized by single-column cells, and the span covers them.
             if span == 1 {
-                let weight = if matches!(src, RowSource::CellsDirect(_)) {
-                    700.0
-                } else {
-                    400.0
-                };
+                // Header cells are set bold, so they are measured bold.
+                let weight = if is_header { 700.0 } else { 400.0 };
                 let style = TextStyle {
                     font_size: ctx.style.body_font_size,
                     font_weight: weight,
@@ -5336,9 +5649,9 @@ fn layout_media(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<B
     let x = x + IMAGE_H_PAD;
     let width = (width - 2.0 * IMAGE_H_PAD).max(0.0);
     // Source resolution. Either an explicit `src` (markdown `![]()` or
-    // `{% media src=… %}`), or an Arca `id` (`{% media id="<uuid>" /%}`).
-    // In production Scriptor rewrites `id` to a concrete `src` before this
-    // runs; locally — the tech-writer workflow while Arca isn't ready — we
+    // `{% media src=… %}`), or an asset `id` (`{% media id="<uuid>" /%}`).
+    // A publishing pipeline may rewrite `id` to a concrete `src` before this
+    // runs; otherwise — the local tech-writer workflow — we
     // resolve the id ourselves by probing `<id>.<ext>` under the assets
     // root for the extensions we can decode (content is re-sniffed below,
     // so a wrong extension still works). `src` wins when both are present.
@@ -5714,7 +6027,6 @@ fn apply_link_style(inlines: &mut Inlines, link_style: &super::style::LinkStyle)
 mod tests {
     use super::*;
     use markdoc::types::Tag as MdTag;
-    use std::collections::HashMap;
 
     #[test]
     fn heading_counters_nest_and_reset() {
@@ -5784,7 +6096,7 @@ mod tests {
         let tag = |name: &str, children: Vec<RenderableTreeNode>| {
             RenderableTreeNode::Tag(Box::new(MdTag {
                 name: name.to_string(),
-                attributes: HashMap::new(),
+                attributes: IndexMap::new(),
                 children,
             }))
         };
@@ -5821,7 +6133,7 @@ mod tests {
     }
 
     fn tag_with_attrs(attrs: &[(&str, Scalar)]) -> MdTag {
-        let mut m = HashMap::new();
+        let mut m = IndexMap::new();
         for (k, v) in attrs {
             m.insert((*k).to_string(), v.clone());
         }
@@ -5883,8 +6195,7 @@ mod tests {
     #[test]
     fn table_override_parses_tag_attributes() {
         use crate::render::style::TableBorders;
-        use std::collections::HashMap;
-        let mut a = HashMap::new();
+        let mut a = IndexMap::new();
         a.insert("borders".to_string(), Scalar::String("horizontal".into()));
         a.insert(
             "header_background".to_string(),
@@ -5903,12 +6214,12 @@ mod tests {
         assert_eq!(ov.header_column, Some(true));
 
         // `stripe="none"` is explicit-off (distinct from "inherit").
-        let mut b = HashMap::new();
+        let mut b = IndexMap::new();
         b.insert("stripe".to_string(), Scalar::String("none".into()));
         assert!(matches!(TableOverride::from_attrs(&b).stripe, Some(None)));
 
         // No attributes → inherit everything (all None).
-        let none = TableOverride::from_attrs(&HashMap::new());
+        let none = TableOverride::from_attrs(&IndexMap::new());
         assert!(none.borders.is_none());
         assert!(none.stripe.is_none());
         assert!(none.column_weights.is_none());

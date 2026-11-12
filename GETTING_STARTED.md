@@ -169,7 +169,7 @@ attributes — useful when alt text gets long:
 
 ### `{% media id="…" /%}` — references by asset id (local workflow)
 
-Adeptus documents reference media by an Arca asset **id** rather than a
+Documents can reference media by an asset **id** rather than a
 path:
 
 ```markdown
@@ -177,9 +177,9 @@ path:
 {% img   id="0a02bb82-1a68-4c5c-883f-406361e1235e" /%}
 ```
 
-In production, Scriptor fetches the asset and rewrites the reference to a
-concrete `src` (e.g. `src="file:///…/0a02bb82….webp"`) before rendering.
-While Arca isn't wired up, markdoc-pdf resolves the id **locally**: put the
+In a production pipeline, the calling service may fetch the asset and rewrite
+the reference to a concrete `src` (e.g. `src="file:///…/0a02bb82….webp"`)
+before rendering. Otherwise markdoc-pdf resolves the id **locally**: put the
 file, named `<id>.<ext>`, anywhere under your `--assets-root` — at the top
 or in a sub-folder — and the renderer finds it. It first checks the root
 for `<id>` with each known extension (`.webp` / `.png` / `.jpg` / `.jpeg` /
@@ -188,7 +188,7 @@ by file stem. The actual format is detected from the file contents, so a
 wrong extension still works. A missing id degrades to the usual placeholder
 plus a `warning: media unavailable: …` line — so a writer can drop the
 downloaded assets into a folder (nested however they arrive) and preview a
-real Adeptus document without changing its `id=` references. `{% img %}` is
+real document without changing its `id=` references. `{% img %}` is
 an alias of `{% media %}`, so both spellings resolve identically.
 
 ### `{% footnote %}` — inline footnotes
@@ -239,7 +239,7 @@ for whoever fills it in by hand. See
 ## Composing a book from `sections`
 
 A large manual doesn't have to live in one file. Give the root document a
-Flux `sections` manifest in its frontmatter — an ordered tree of
+`sections` manifest in its frontmatter — an ordered tree of
 `[section, [subsection, …]]` file paths — and each file is stitched into one
 book, in order, when you render the root:
 
@@ -275,6 +275,8 @@ whole. It's built on the same inclusion machinery as `{% partial %}`
   lives in [`examples/themes/README.md`](examples/themes/README.md).
 - For the full Markdoc tag/schema reference, see the parent
   `markdoc/` crate's documentation.
-- Frontmatter fields supported out of the box are defined in
-  `flux-types/` — start with `title`, `description`, `authors`,
-  `language`, `releaseDate`, `creator`.
+- The frontmatter fields the renderer reads are `title`, `description`,
+  `authors`, `creator`, `language`, `releaseDate`, `updateDate` and
+  `sections` (`src/frontmatter.rs`), and any list of maps the style turns
+  into a table (`[frontmatter_tables]`). Every other field is still
+  available to templates as `{name}`.

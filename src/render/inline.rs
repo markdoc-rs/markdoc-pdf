@@ -181,6 +181,26 @@ pub fn anchor_id_attr(tag: &markdoc::types::Tag) -> Option<String> {
     None
 }
 
+/// The text a scalar in the render tree prints as: a string as it is, a
+/// number as JavaScript prints it (`String(n)`: `2.5`, `1e21`), a boolean as
+/// `true` / `false`, an array as its items' texts run together (upstream
+/// splices an interpolated array into separate children; one that arrives
+/// whole prints the same way), and nothing for null and undefined.
+///
+/// Upstream Markdoc keeps an interpolation's type (`{% $count %}` is a
+/// number in the tree); the old pipeline stringified every one. Upstream's
+/// HTML renderer prints a boolean as nothing; this renderer keeps printing
+/// `true` / `false`, as before and as the site does.
+pub(crate) fn scalar_text(value: &Scalar) -> Option<String> {
+    match value {
+        Scalar::String(s) => Some(s.clone()),
+        Scalar::Number(_) => markdoc::schema::value::scalar_to_js_string(value).ok(),
+        Scalar::Boolean(b) => Some(b.to_string()),
+        Scalar::Array(items) => Some(items.iter().filter_map(scalar_text).collect()),
+        _ => None,
+    }
+}
+
 /// Non-empty string attribute, trimmed. Used for `{% tagref text="…" /%}`.
 fn non_empty_string_attr(tag: &markdoc::types::Tag, key: &str) -> Option<String> {
     match tag.attributes.get(key) {
@@ -197,7 +217,7 @@ fn non_empty_string_attr(tag: &markdoc::types::Tag, key: &str) -> Option<String>
 }
 
 /// Extract the cross-document target id from a `<tagref>` Tag node.
-/// `doc="<id>"` selects which Adeptus document the `id="<anchor>"`
+/// `doc="<id>"` selects which document the `id="<anchor>"`
 /// lives in. Empty / absent attribute means "intra-document reference"
 /// and the caller falls back to plain `anchor_id_attr` resolution.
 pub fn doc_attr(tag: &markdoc::types::Tag) -> Option<String> {
@@ -239,29 +259,20 @@ fn collect_into(
     for child in children {
         match child {
             RenderableTreeNode::Scalar(Scalar::String(s)) => out.text.push_str(s),
-            RenderableTreeNode::Scalar(Scalar::Array(arr)) => {
-                for item in arr {
-                    if let Scalar::String(s) = item {
-                        out.text.push_str(s);
-                    }
+            RenderableTreeNode::Scalar(value) => {
+                if let Some(text) = scalar_text(value) {
+                    out.text.push_str(&text);
                 }
             }
-            RenderableTreeNode::Scalar(_) => {}
             RenderableTreeNode::Tag(t) => {
                 let prop = match t.name.as_str() {
                     "strong" => Some(InlineProp::Bold),
                     "em" => Some(InlineProp::Italic),
                     "s" | "strikethrough" => Some(InlineProp::Strikethrough),
                     "code" => Some(InlineProp::Code),
-                    "softbreak" => {
-                        // CommonMark soft break (a single newline
-                        // within a paragraph). Emit a space so words
-                        // either side stay separated; let parley pick
-                        // the wrap point.
-                        out.text.push(' ');
-                        collect_into(out, &t.children, footnotes, crossref_labels);
-                        continue;
-                    }
+                    // A CommonMark soft break (a single newline within a
+                    // paragraph) arrives as the text " ", upstream's
+                    // softbreak; parley picks the wrap point.
                     "br" | "hardbreak" => {
                         // CommonMark hard break (two trailing spaces or
                         // backslash). Force a line break — parley treats
@@ -347,8 +358,8 @@ fn collect_into(
                         //     the raw anchor id.
                         //
                         //   {% tagref doc="D" id="X" /%}    — cross-doc.
-                        //     Adeptus is meant to rewrite this BEFORE
-                        //     handing the source to Scriptor (into either
+                        //     A publishing platform is meant to rewrite this
+                        //     BEFORE handing the source to the renderer (into either
                         //     a normal `[text](https://…)` external URL
                         //     or an intra-bundle `{% tagref id="…" /%}`).
                         //     During local iteration nothing rewrites it,
@@ -453,9 +464,9 @@ fn collect_into(
                         // Inline cross-document reference:
                         //   See {% ref document="4100237" %} for details.
                         //   {% ref document="4100237" label="the migration guide" %}
-                        // Adeptus resolves it to the target's title + URL. Here,
-                        // without Adeptus, render the `label` (or "doc <number>")
-                        // as a placeholder link to a `flux:` URI — it styles like
+                        // A publishing platform resolves it to the target's title +
+                        // URL. Here, without one, render the `label` (or "doc <number>")
+                        // as a placeholder link to a `ref:` URI — it styles like
                         // any other link; the real target is resolved upstream.
                         let attr = |k: &str| match t.attributes.get(k) {
                             Some(Scalar::String(s)) if !s.trim().is_empty() => {
@@ -471,9 +482,9 @@ fn collect_into(
                         if let Some(target) = doc.clone().or_else(|| attr("uuid")) {
                             let label = attr("label").unwrap_or_else(|| format!("doc {target}"));
                             let href = if doc.is_some() {
-                                format!("flux:document/{target}")
+                                format!("ref:document/{target}")
                             } else {
-                                format!("flux:uuid/{target}")
+                                format!("ref:uuid/{target}")
                             };
                             let start = out.text.len();
                             out.text.push_str(&label);
@@ -582,7 +593,7 @@ mod tests {
         // Application-specific schemes are fine — viewers may not
         // dispatch them, but the renderer can't know that and
         // shouldn't warn on syntactically-valid schemes.
-        assert!(is_navigable_uri("arca://abc-def"));
+        assert!(is_navigable_uri("asset://abc-def"));
         assert!(is_navigable_uri("vscode://file/foo"));
         // Scheme allows `+`, `-`, `.` after the leading ALPHA.
         assert!(is_navigable_uri("git+ssh://host/repo"));
@@ -611,11 +622,7 @@ mod tests {
     }
 
     fn tagref_label(src: &str, section_label: Option<&str>) -> (String, Vec<LinkRange>) {
-        use markdoc::types::Config;
-        use markdoc::{parse, transform};
-
-        let doc = parse(src, None).unwrap();
-        let tree = transform(&doc, &Config::default()).unwrap();
+        let tree = crate::pipeline::render_tree(src).unwrap();
         let children = paragraph_with_tagref(&tree).expect("paragraph containing tagref");
         let mut labels = HashMap::new();
         if let Some(label) = section_label {

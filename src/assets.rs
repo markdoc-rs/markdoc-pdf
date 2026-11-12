@@ -1,10 +1,10 @@
 //! Pluggable asset fetching for media references.
 //!
-//! `markdoc-pdf` doesn't speak Arca directly; it goes through this trait
-//! so that any fetch backend (filesystem, HTTP, in-process Arca client,
-//! pre-bundled in-memory cache) can be plugged in. Default deployments
-//! use [`FsAssetResolver`] for local-path references; an Arca-backed
-//! resolver can ship later as a separate impl when the contract lands.
+//! `markdoc-pdf` doesn't speak to any asset service directly; it goes through
+//! this trait so that any fetch backend (filesystem, HTTP, an asset-service
+//! client, pre-bundled in-memory cache) can be plugged in. Default deployments
+//! use [`FsAssetResolver`] for local-path references; [`AssetServiceResolver`]
+//! fetches `{scheme}://{asset_id}` references from an asset service over HTTP.
 //!
 //! The renderer treats fetch failures as soft errors — the image is
 //! replaced by a placeholder rather than aborting the PDF generation.
@@ -33,12 +33,12 @@ pub enum AssetError {
 
 pub trait AssetResolver: Send + Sync {
     /// Fetch the bytes referenced by `uri`. The URI can be a relative or
-    /// absolute path, an `http://` / `https://` URL, an `arca://` reference,
-    /// or anything else a caller-supplied resolver knows how to handle.
+    /// absolute path, an `http://` / `https://` URL, an asset-service
+    /// reference, or anything else a caller-supplied resolver knows how to handle.
     fn fetch(&self, uri: &str) -> Result<Vec<u8>, AssetError>;
 
-    /// Resolve a bare asset `id` (no path, no extension — e.g. an Arca
-    /// UUID) to a URI that [`fetch`](Self::fetch) can load. A filesystem
+    /// Resolve a bare asset `id` (no path, no extension — e.g. an asset
+    /// service's UUID) to a URI that [`fetch`](Self::fetch) can load. A filesystem
     /// resolver searches its root recursively for a file whose stem matches;
     /// resolvers that can't map an id return `None` (the default). Used as a
     /// fallback for `{% media id="…" /%}` when the id isn't a file sitting
@@ -62,7 +62,7 @@ impl AssetResolver for NullAssetResolver {
 
 /// Resolver that loads files from a filesystem root. URIs are joined to
 /// `root` as relative paths; absolute paths and `file://` URIs are also
-/// honored. Other schemes (`http`, `https`, `arca`, …) error.
+/// honored. Other schemes (`http`, `https`, …) error.
 pub struct FsAssetResolver {
     pub root: PathBuf,
     /// Lazily-built index of `<stem>` → path (relative to `root`) for every
@@ -150,7 +150,7 @@ fn build_id_index(root: &Path) -> HashMap<String, PathBuf> {
 
 /// HTTP/HTTPS asset resolver. Performs a synchronous GET and returns
 /// the response body. Other schemes return `UnsupportedScheme` so this
-/// can sit in a `CompositeAssetResolver` alongside FS/Arca.
+/// can sit in a `CompositeAssetResolver` alongside FS / asset-service resolvers.
 ///
 /// Defaults: 10-second timeout, 64 MiB max body, no per-request retry.
 /// Use [`HttpAssetResolver::with_agent`] to customise.
@@ -222,16 +222,18 @@ impl AssetResolver for HttpAssetResolver {
     }
 }
 
-/// Resolver for the Adeptus / Arca asset URI scheme:
-///   - `arca://{asset_id}`              → `GET {base}/download/{asset_id}`
-///   - `arca://{asset_id}/{derivative}` → `GET {base}/download/{asset_id}/{derivative}`
+/// Resolver for an asset service's own URI scheme, named by the caller:
+///   - `{scheme}://{asset_id}`              → `GET {base}/download/{asset_id}`
+///   - `{scheme}://{asset_id}/{derivative}` → `GET {base}/download/{asset_id}/{derivative}`
 ///
-/// Authenticates by sending `X-Subject-Id` (the Ory Oathkeeper-injected
-/// subject identifier the platform uses everywhere). The id is the
-/// caller's choice — typically the PDF generator's service account or
-/// the requesting user.
-pub struct ArcaAssetResolver {
-    /// Base URL, no trailing slash. Example: `http://arca:3002`.
+/// Authenticates by sending `X-Subject-Id` (a subject identifier as injected
+/// by an identity proxy such as Ory Oathkeeper). The id is the caller's
+/// choice — typically the PDF generator's service account or the
+/// requesting user.
+pub struct AssetServiceResolver {
+    /// URI scheme this resolver answers, without `://`. Example: `asset`.
+    pub scheme: String,
+    /// Base URL, no trailing slash. Example: `http://assets:3002`.
     pub base_url: String,
     /// Sent as `X-Subject-Id`. Required for non-public assets.
     pub subject_id: Option<String>,
@@ -239,9 +241,14 @@ pub struct ArcaAssetResolver {
     pub max_body_bytes: usize,
 }
 
-impl ArcaAssetResolver {
-    pub fn new(base_url: impl Into<String>, subject_id: Option<String>) -> Self {
+impl AssetServiceResolver {
+    pub fn new(
+        scheme: impl Into<String>,
+        base_url: impl Into<String>,
+        subject_id: Option<String>,
+    ) -> Self {
         Self {
+            scheme: scheme.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             subject_id,
             agent: ureq::Agent::config_builder()
@@ -253,21 +260,23 @@ impl ArcaAssetResolver {
     }
 
     fn build_url(&self, uri: &str) -> Option<String> {
-        let rest = uri.strip_prefix("arca://")?;
+        let rest = uri
+            .strip_prefix(self.scheme.as_str())
+            .and_then(|r| r.strip_prefix("://"))?;
         if rest.is_empty() {
             return None;
         }
         // Pass through path verbatim — single id (`abc`) or id/derivative
-        // (`abc/web-large`). Strip any query string; Arca's contract
+        // (`abc/web-large`). Strip any query string; the download contract
         // doesn't use query params, derivatives are URL-path-encoded.
         let path = rest.split('?').next().unwrap_or(rest);
         Some(format!("{}/download/{}", self.base_url, path))
     }
 }
 
-impl AssetResolver for ArcaAssetResolver {
+impl AssetResolver for AssetServiceResolver {
     fn fetch(&self, uri: &str) -> Result<Vec<u8>, AssetError> {
-        if !uri.starts_with("arca://") {
+        if uri.split_once("://").map(|(scheme, _)| scheme) != Some(self.scheme.as_str()) {
             let scheme = uri.split("://").next().unwrap_or("?").to_string();
             return Err(AssetError::UnsupportedScheme { scheme });
         }
@@ -280,7 +289,7 @@ impl AssetResolver for ArcaAssetResolver {
         }
         let mut resp = req
             .call()
-            .map_err(|e| AssetError::Other(format!("Arca fetch {url}: {e}")))?;
+            .map_err(|e| AssetError::Other(format!("{} fetch {url}: {e}", self.scheme)))?;
         let mut buf: Vec<u8> = Vec::new();
         let mut reader = resp
             .body_mut()
@@ -292,8 +301,8 @@ impl AssetResolver for ArcaAssetResolver {
         })?;
         if buf.len() > self.max_body_bytes {
             return Err(AssetError::Other(format!(
-                "Arca response exceeds max_body_bytes ({})",
-                self.max_body_bytes
+                "{} response exceeds max_body_bytes ({})",
+                self.scheme, self.max_body_bytes
             )));
         }
         Ok(buf)
@@ -585,55 +594,61 @@ mod tests {
     #[test]
     fn http_resolver_rejects_non_http_scheme() {
         let r = HttpAssetResolver::new();
-        let err = r.fetch("arca://abc").unwrap_err();
+        let err = r.fetch("asset://abc").unwrap_err();
         assert!(matches!(err, AssetError::UnsupportedScheme { .. }));
         let err = r.fetch("file:///x").unwrap_err();
         assert!(matches!(err, AssetError::UnsupportedScheme { .. }));
     }
 
     #[test]
-    fn arca_resolver_builds_download_url_for_bare_id() {
-        let r = ArcaAssetResolver::new("http://arca:3002", None);
+    fn asset_service_resolver_builds_download_url_for_bare_id() {
+        let r = AssetServiceResolver::new("asset", "http://assets:3002", None);
         assert_eq!(
-            r.build_url("arca://abc-123").unwrap(),
-            "http://arca:3002/download/abc-123"
+            r.build_url("asset://abc-123").unwrap(),
+            "http://assets:3002/download/abc-123"
         );
     }
 
     #[test]
-    fn arca_resolver_builds_url_for_derivative() {
-        let r = ArcaAssetResolver::new("http://arca:3002/", None);
+    fn asset_service_resolver_builds_url_for_derivative() {
+        let r = AssetServiceResolver::new("asset", "http://assets:3002/", None);
         assert_eq!(
-            r.build_url("arca://abc-123/web-large").unwrap(),
-            "http://arca:3002/download/abc-123/web-large"
+            r.build_url("asset://abc-123/web-large").unwrap(),
+            "http://assets:3002/download/abc-123/web-large"
         );
     }
 
     #[test]
-    fn arca_resolver_strips_trailing_slash_on_base() {
-        let r = ArcaAssetResolver::new("http://arca:3002/", None);
+    fn asset_service_resolver_strips_trailing_slash_on_base() {
+        let r = AssetServiceResolver::new("asset", "http://assets:3002/", None);
         assert_eq!(
-            r.build_url("arca://x").unwrap(),
-            "http://arca:3002/download/x"
+            r.build_url("asset://x").unwrap(),
+            "http://assets:3002/download/x"
         );
     }
 
     #[test]
-    fn arca_resolver_drops_query_params() {
-        // The Arca contract uses path segments (derivative names), not
+    fn asset_service_resolver_drops_query_params() {
+        // The download contract uses path segments (derivative names), not
         // query strings — strip any `?...` suffix the markdoc author
         // may have added by mistake.
-        let r = ArcaAssetResolver::new("http://arca:3002", None);
+        let r = AssetServiceResolver::new("asset", "http://assets:3002", None);
         assert_eq!(
-            r.build_url("arca://abc?w=400").unwrap(),
-            "http://arca:3002/download/abc"
+            r.build_url("asset://abc?w=400").unwrap(),
+            "http://assets:3002/download/abc"
         );
     }
 
     #[test]
-    fn arca_resolver_rejects_non_arca_scheme() {
-        let r = ArcaAssetResolver::new("http://arca:3002", None);
+    fn asset_service_resolver_rejects_other_schemes() {
+        let r = AssetServiceResolver::new("asset", "http://assets:3002", None);
         let err = r.fetch("https://example.com/x.png").unwrap_err();
+        assert!(matches!(err, AssetError::UnsupportedScheme { .. }));
+        // A scheme that merely starts with the resolver's is not its own.
+        let err = r.fetch("assets://abc").unwrap_err();
+        assert!(matches!(err, AssetError::UnsupportedScheme { .. }));
+        assert_eq!(r.build_url("assets://abc"), None);
+        let err = r.fetch("abc").unwrap_err();
         assert!(matches!(err, AssetError::UnsupportedScheme { .. }));
     }
 
@@ -677,15 +692,15 @@ mod tests {
         let counter = Arc::new(CountingResolver::new());
         let cache = CachingAssetResolver::new(Box::new(DelegateResolver(counter.clone())));
 
-        let a1 = cache.fetch("arca://abc").unwrap();
-        let a2 = cache.fetch("arca://abc").unwrap();
-        let b = cache.fetch("arca://other").unwrap();
-        let a3 = cache.fetch("arca://abc").unwrap();
+        let a1 = cache.fetch("asset://abc").unwrap();
+        let a2 = cache.fetch("asset://abc").unwrap();
+        let b = cache.fetch("asset://other").unwrap();
+        let a3 = cache.fetch("asset://abc").unwrap();
 
-        assert_eq!(a1, b"body-of-arca://abc");
+        assert_eq!(a1, b"body-of-asset://abc");
         assert_eq!(a2, a1);
         assert_eq!(a3, a1);
-        assert_eq!(b, b"body-of-arca://other");
+        assert_eq!(b, b"body-of-asset://other");
 
         // Inner saw exactly two unique URIs, regardless of repeats.
         assert_eq!(counter.count(), 2);
@@ -786,11 +801,11 @@ mod tests {
     #[test]
     fn composite_skips_resolvers_that_dont_support_scheme() {
         // FS handles only fs paths (and `file://`); Composite should
-        // try it, see UnsupportedScheme for `arca://`, then move on.
+        // try it, see UnsupportedScheme for `asset://`, then move on.
         // With nothing else able to handle it, the final error is the
         // last UnsupportedScheme observed.
         let r = CompositeAssetResolver::new().push(Box::new(FsAssetResolver::new("/tmp")));
-        let err = r.fetch("arca://x").unwrap_err();
+        let err = r.fetch("asset://x").unwrap_err();
         assert!(matches!(err, AssetError::UnsupportedScheme { .. }));
     }
 }

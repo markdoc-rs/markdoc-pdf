@@ -653,8 +653,6 @@ pub fn emit_watermark(
     match &watermark.kind {
         super::style::WatermarkKind::Image(img) => {
             // Reuse the logo decoder + cache — same kind of asset.
-            // Every field of LogoSpec is set, so there is nothing for a
-            // `..Default::default()` to fill in.
             let logo = LogoSpec {
                 src: img.src.clone(),
                 id: String::new(),

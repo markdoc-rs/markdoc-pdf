@@ -5,7 +5,7 @@
 //! fields are `#[serde(default)]` so partial overrides are easy: a TOML
 //! file can specify just the page size and inherit everything else.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Deserialize;
 
@@ -602,6 +602,56 @@ pub struct Style {
     /// optional logo. Source documents stay output-agnostic — all
     /// cover-page knobs live here in the style.
     pub coverpage: CoverPageStyle,
+
+    // ── Tables drawn from frontmatter ─────────────────────────────────
+    /// Tags that stand for a table built from the document's frontmatter,
+    /// keyed by tag name. Each `{% <name> /%}` in the composed document
+    /// (partials and sections included) becomes a level-2 heading and a
+    /// table, one row per map in the frontmatter list the entry names.
+    /// Empty by default: a tag named nowhere here renders as Markdoc
+    /// renders it, which for a self-closing tag is nothing.
+    ///
+    /// ```toml
+    /// [frontmatter_tables.document-history]
+    /// key = "documentHistory"
+    /// heading = "Document history"
+    /// columns = [
+    ///   { field = "version", header = "Version" },
+    ///   { field = "date", header = "Date" },
+    ///   { field = "description", header = "Description" },
+    /// ]
+    /// ```
+    pub frontmatter_tables: BTreeMap<String, FrontmatterTable>,
+}
+
+/// One entry of [`Style::frontmatter_tables`]: where the rows of a table
+/// come from, its columns, and the heading above it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrontmatterTable {
+    /// The frontmatter field the rows come from: a list of maps, one row
+    /// per map. An item that is not a map is skipped. When the field is
+    /// absent, is not a list or holds no map, the tag is removed, heading
+    /// and all.
+    pub key: String,
+    /// The heading above the table. Absent or `""`, there is none. The
+    /// tag's `title` attribute replaces it, and `title=""` drops it.
+    #[serde(default)]
+    pub heading: Option<String>,
+    /// The columns, left to right. With none, the tag is removed.
+    pub columns: Vec<FrontmatterColumn>,
+}
+
+/// One column of a [`FrontmatterTable`].
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrontmatterColumn {
+    /// The key each cell is read from, in a map of the list. A cell whose
+    /// key is absent, or holds no text (a list, a map, null, `""`), is
+    /// empty; a number reads as YAML read it.
+    pub field: String,
+    /// The column's header cell.
+    pub header: String,
 }
 
 impl Default for Style {
@@ -678,6 +728,7 @@ impl Default for Style {
             body_font_families: Vec::new(),
             hyphenation: HyphenationStyle::default(),
             coverpage: CoverPageStyle::default(),
+            frontmatter_tables: BTreeMap::new(),
         }
     }
 }
@@ -1545,7 +1596,7 @@ pub struct LogoSpec {
     /// `{id}.webp` / `.png` / … then `AssetResolver::resolve_id`.
     pub id: String,
     /// Asset URI — anything the configured asset resolver understands
-    /// (`file://path`, relative path, `https://…`, `arca://…`). A bare
+    /// (`file://path`, relative path, `https://…`, `asset://…`). A bare
     /// GUID with no extension is treated as an `id`. Cover-page `src` is
     /// a template (`{title}`, `{coverImage}`, …).
     pub src: String,
@@ -1687,6 +1738,65 @@ mod tests {
         let s = Style::default();
         assert_eq!(s.page_width, 595.0);
         assert_eq!(s.heading.h1.font_size, 26.0);
+    }
+
+    #[test]
+    fn frontmatter_tables_are_none_unless_a_style_names_them() {
+        assert!(Style::default().frontmatter_tables.is_empty());
+        assert!(
+            Style::from_toml_str("page_width = 612.0\n")
+                .unwrap()
+                .frontmatter_tables
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn frontmatter_tables_load_by_tag_name() {
+        let s = Style::from_toml_str(
+            r#"
+[frontmatter_tables.changes]
+key = "changeLog"
+heading = "Changes"
+columns = [{ field = "when", header = "When" }, { field = "what", header = "What" }]
+
+[frontmatter_tables.people]
+key = "contributors"
+columns = [{ field = "name", header = "Name" }]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            s.frontmatter_tables["changes"],
+            FrontmatterTable {
+                key: "changeLog".into(),
+                heading: Some("Changes".into()),
+                columns: vec![
+                    FrontmatterColumn {
+                        field: "when".into(),
+                        header: "When".into(),
+                    },
+                    FrontmatterColumn {
+                        field: "what".into(),
+                        header: "What".into(),
+                    },
+                ],
+            }
+        );
+        assert_eq!(s.frontmatter_tables["people"].heading, None);
+        assert_eq!(s.frontmatter_tables.len(), 2);
+    }
+
+    #[test]
+    fn a_frontmatter_table_needs_its_key_and_columns_and_nothing_else() {
+        for toml in [
+            "[frontmatter_tables.t]\ncolumns = []\n",
+            "[frontmatter_tables.t]\nkey = \"k\"\n",
+            "[frontmatter_tables.t]\nkey = \"k\"\ncolumns = []\nlevel = 3\n",
+            "[frontmatter_tables.t]\nkey = \"k\"\ncolumns = [{ field = \"f\" }]\n",
+        ] {
+            assert!(Style::from_toml_str(toml).is_err(), "{toml}");
+        }
     }
 
     #[test]

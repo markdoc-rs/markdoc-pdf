@@ -26,15 +26,10 @@ The easiest path if you already have Rust installed.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-`markdoc-pdf` depends on the sibling crates `markdoc` and
-`flux-types` via relative `path = "../markdoc"` references. Clone
-all three side-by-side first:
+Cargo fetches the dependencies, so this repository is the only checkout:
 
 ```sh
-mkdir entsp && cd entsp
-git clone https://github.com/entsp/markdoc.git
-git clone https://github.com/entsp/flux-types.git
-git clone https://github.com/entsp/markdoc-pdf.git
+git clone https://github.com/markdoc-rs/markdoc-pdf.git
 cd markdoc-pdf
 cargo install --path . --locked
 ```
@@ -82,13 +77,10 @@ Two paths — pick whichever fits your shell.
    <https://www.rust-lang.org/tools/install>. Pick the **MSVC**
    toolchain when prompted (default). The installer also installs
    the Visual Studio Build Tools if you don't already have them.
-2. Clone the three sibling repos into one parent folder:
+2. Clone the repository and install from it:
 
    ```powershell
-   mkdir entsp; cd entsp
-   git clone https://github.com/entsp/markdoc.git
-   git clone https://github.com/entsp/flux-types.git
-   git clone https://github.com/entsp/markdoc-pdf.git
+   git clone https://github.com/markdoc-rs/markdoc-pdf.git
    cd markdoc-pdf
    cargo install --path . --locked
    ```
@@ -133,15 +125,23 @@ identically on Linux (Podman or Docker), macOS (Docker Desktop /
 Podman Machine / OrbStack), and Windows (Docker Desktop / Podman
 Machine).
 
+Rust on Alpine links the binary statically, so it runs on any Linux
+afterwards. That takes in fontconfig, the C library that finds the
+fonts, and what it links in turn: the `*-static` packages below carry
+their static archives, and `PKG_CONFIG_ALL_STATIC=1` has the build use
+them.
+
 ### One-shot build
 
-From the parent folder containing `markdoc/`, `flux-types/` and
-`markdoc-pdf/` side-by-side:
+From the folder that holds your `markdoc-pdf/` checkout:
 
 ```sh
-podman run --rm -v "$PWD":/work -w /work/markdoc-pdf \
+podman run --rm -v "$PWD":/work -w /work/markdoc-pdf -e PKG_CONFIG_ALL_STATIC=1 \
     docker.io/library/rust:1.93-alpine \
-    sh -c 'apk add --no-cache musl-dev && cargo build --release --bin markdoc-pdf'
+    sh -c 'apk add --no-cache musl-dev pkgconf fontconfig-dev fontconfig-static \
+               freetype-static expat-static libpng-static zlib-static \
+               brotli-static bzip2-static \
+           && cargo build --release --bin markdoc-pdf'
 # Binary lands at: markdoc-pdf/target/release/markdoc-pdf
 ```
 
@@ -154,11 +154,14 @@ Build once, then drop into a shell with the toolchain ready:
 ```sh
 podman build -t markdoc-pdf-dev - <<'EOF'
 FROM docker.io/library/rust:1.93-alpine
-RUN apk add --no-cache musl-dev pkgconfig openssl-dev git
+RUN apk add --no-cache musl-dev pkgconf fontconfig-dev fontconfig-static \
+        freetype-static expat-static libpng-static zlib-static \
+        brotli-static bzip2-static git
+ENV PKG_CONFIG_ALL_STATIC=1
 WORKDIR /work
 EOF
 
-# From the parent folder containing the three sibling repos:
+# From the folder that holds your markdoc-pdf/ checkout:
 podman run --rm -it -v "$PWD":/work -w /work/markdoc-pdf \
     markdoc-pdf-dev sh
 # inside the container:
@@ -169,12 +172,15 @@ exit
 ### Render docs without a host install
 
 Run `markdoc-pdf` itself inside the container — useful for one-off
-renders on a machine where you don't want to install anything:
+renders on a machine where you don't want to install anything. The
+container has no fonts of its own, hence `font-noto`:
 
 ```sh
-podman run --rm -v "$PWD":/work -w /work \
+podman run --rm -v "$PWD":/work -w /work -e PKG_CONFIG_ALL_STATIC=1 \
     docker.io/library/rust:1.93-alpine \
-    sh -c 'apk add --no-cache musl-dev >/dev/null \
+    sh -c 'apk add --no-cache musl-dev pkgconf fontconfig-dev fontconfig-static \
+               freetype-static expat-static libpng-static zlib-static \
+               brotli-static bzip2-static font-noto >/dev/null \
            && cd markdoc-pdf && cargo build --release --bin markdoc-pdf 2>/dev/null \
            && ./target/release/markdoc-pdf -i ../my-doc/intro.mdoc -o /work/intro.pdf -s examples/themes/letter.style.toml'
 ```
@@ -184,32 +190,61 @@ better for iteration.
 
 ## Option E: pre-built binaries
 
-Attached to each tagged release on the forge. The workflow at
-`.forgejo/workflows/release.yml` builds four of them on a tag push:
+Attached to each
+[release](https://github.com/markdoc-rs/markdoc-pdf/releases).
+`.github/workflows/release.yml` builds them when a new version in
+`Cargo.toml` reaches main, and tags that commit:
 
 | Asset | Platform |
 |-------|----------|
-| `markdoc-pdf-linux-x86_64` | Linux x86-64, static (musl) |
-| `markdoc-pdf-linux-aarch64` | Linux ARM64, static (musl) |
-| `markdoc-pdf-windows-x86_64.exe` | Windows x86-64, MSVC ABI, static CRT |
-| `markdoc-pdf-windows-aarch64.exe` | Windows ARM64, MSVC ABI, static CRT |
+| `markdoc-pdf-linux-x86_64` | Linux x86-64, static (musl): any distribution |
+| `markdoc-pdf-linux-x86_64-glibc` | Linux x86-64, glibc 2.39 or newer |
+| `markdoc-pdf-linux-aarch64` | Linux ARM64, static (musl): any distribution |
+| `markdoc-pdf-macos-aarch64` | macOS, Apple Silicon |
+| `markdoc-pdf-macos-x86_64` | macOS, Intel |
+| `markdoc-pdf-windows-x86_64.exe` | Windows x86-64 |
+| `markdoc-pdf-windows-aarch64.exe` | Windows ARM64 |
 
 Each ships a `.sha256` beside it, and `themes.tar.gz` / `themes.zip`
-carry the `examples/themes/` catalogue that `--style` needs.
+carry the `examples/themes/` catalogue that `--style` needs. Every
+asset also has a GitHub build-provenance attestation, which ties it to
+the commit and the workflow run that built it:
+
+```sh
+gh attestation verify markdoc-pdf-linux-x86_64 --repo markdoc-rs/markdoc-pdf
+gh attestation verify markdoc-pdf-linux-x86_64 --repo markdoc-rs/markdoc-pdf \
+    --bundle markdoc-pdf-linux-x86_64.sigstore.json
+```
+
+The release carries each attestation too, as `<asset>.sigstore.json`
+beside the asset; the second form checks against that copy instead of
+asking GitHub.
 
 Download, `chmod +x`, drop it on `$PATH`:
 
 ```sh
-curl -LO https://git.mirdev.net/jalu/markdoc-pdf/releases/download/0.5.0/markdoc-pdf-linux-x86_64
+curl -LO https://github.com/markdoc-rs/markdoc-pdf/releases/latest/download/markdoc-pdf-linux-x86_64
 chmod +x markdoc-pdf-linux-x86_64
 sudo mv markdoc-pdf-linux-x86_64 /usr/local/bin/markdoc-pdf
 ```
 
-The Linux binaries are statically linked — `static-pie`, zero `NEEDED`
-entries — so they run on any glibc or musl distro regardless of its
-libc version. They still need fonts installed; see the note at the
-top of this file. macOS is not built: the runners are Linux and
-Apple's SDK is not redistributable, so build from source (Option A).
+Three Linux builds, for two kinds of machine:
+
+- `markdoc-pdf-linux-x86_64` and `markdoc-pdf-linux-aarch64` (ARM64) are
+  statically linked — `static-pie`, zero `NEEDED` entries, fontconfig
+  built in — so they run on any distribution whatever its libc: Alpine,
+  an older CI image, a current desktop. They are the ones `tw`
+  downloads. On a system whose fontconfig is newer than the one built
+  in, they print a `Fontconfig warning` for each part of the system's
+  font configuration they do not know, and skip that part.
+- `markdoc-pdf-linux-x86_64-glibc` uses the system's own glibc and
+  fontconfig, so it reads that configuration as the system does and
+  says nothing about it. It needs glibc 2.39 or newer (Ubuntu 24.04,
+  Debian 13, Fedora 40 and later) and the `fontconfig` package. To have
+  `tw` run it instead, point `MARKDOC_PDF` at it.
+
+All of them still need fonts installed; see the note at the top of this
+file.
 
 ## Updating
 
@@ -263,10 +298,11 @@ database dependency; you can ignore the warnings.
 
 **`panicked at … fontique … NoMatch`** — no usable font is installed.
 See the note at the top of this file; `apk add font-noto` /
-`apt install fonts-noto-core` fixes it. A `FROM scratch` container
-needs the `.ttf` files copied into `/usr/share/fonts/` next to the
-binary (fontconfig's own `/etc/fonts/fonts.conf` is optional — without
-it you get a warning on stderr and a correct PDF).
+`apt install fonts-noto-core` fixes it. A `FROM scratch` container,
+with the static `markdoc-pdf-linux-x86_64` in it, needs the `.ttf`
+files copied into `/usr/share/fonts/` (fontconfig's own
+`/etc/fonts/fonts.conf` is optional — without it you get `Fontconfig
+error: Cannot load default config file` on stderr and a correct PDF).
 
 **Fonts look wrong / missing characters** — the default family chain
 leads with Noto Sans and falls through script-specific Noto faces,

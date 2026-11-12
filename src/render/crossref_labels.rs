@@ -115,17 +115,13 @@ fn extract_heading_title(children: &[RenderableTreeNode]) -> String {
 fn extract_plain(out: &mut String, children: &[RenderableTreeNode]) {
     for child in children {
         match child {
-            RenderableTreeNode::Scalar(Scalar::String(s)) => out.push_str(s),
-            RenderableTreeNode::Scalar(Scalar::Array(items)) => {
-                for item in items {
-                    if let Scalar::String(s) = item {
-                        out.push_str(s)
-                    }
+            RenderableTreeNode::Scalar(value) => {
+                if let Some(text) = super::inline::scalar_text(value) {
+                    out.push_str(&text);
                 }
             }
             RenderableTreeNode::Tag(t) if t.name == "tag" => {}
             RenderableTreeNode::Tag(t) => extract_plain(out, &t.children),
-            RenderableTreeNode::Scalar(_) => {}
         }
     }
 }
@@ -144,8 +140,6 @@ fn attr_is_false(tag: &Tag, key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use markdoc::types::Config;
-    use markdoc::{parse, transform};
 
     fn enabled_numbering() -> HeadingNumbering {
         HeadingNumbering {
@@ -156,8 +150,7 @@ mod tests {
     }
 
     fn labels_for(src: &str, numbering: HeadingNumbering) -> HashMap<String, String> {
-        let doc = parse(src, None).unwrap();
-        let tree = transform(&doc, &Config::default()).unwrap();
+        let tree = crate::pipeline::render_tree(src).unwrap();
         build_crossref_labels(&tree, &numbering)
     }
 

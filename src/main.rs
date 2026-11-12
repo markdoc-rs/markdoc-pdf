@@ -5,17 +5,19 @@
 //! possible) a hint about how to fix it.
 
 use clap::Parser;
-use flux_types::{FluxFrontmatter, HistoryEntry};
-use markdoc::{
-    Context, Node, evaluate_conditionals, parse,
-    partials::{PartialResolver, expand_partials},
-    resolve_crossrefs, resolve_footnotes, transform_with_context,
-    types::{Config, NodeType, Scalar},
-};
+use markdoc::IndexMap;
+use markdoc::ast::Node;
+use markdoc::ext::ParseOptions;
+use markdoc::ext::partials::PartialResolver;
+use markdoc::types::{NodeType, Scalar};
 use markdoc_pdf::assets::FsAssetResolver;
 use markdoc_pdf::dates;
-use markdoc_pdf::render::{ExternalTagref, RenderContext, Style, render_pdf_with};
-use std::collections::HashMap;
+use markdoc_pdf::frontmatter;
+use markdoc_pdf::pipeline;
+use markdoc_pdf::render::{
+    ExternalTagref, FrontmatterTable, RenderContext, Style, render_pdf_with,
+};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -53,6 +55,20 @@ struct Args {
     /// document with media siblings.
     #[arg(long, value_name = "DIR")]
     assets_root: Option<PathBuf>,
+
+    /// Tag-schema overlay declaring the tags a corpus has of its own, on
+    /// top of markdoc's built-in set and markdoc-pdf's own overlay.
+    /// Repeatable, applied in order. Its `[parse]` and `[render]` tables, if
+    /// any, set how documents are read (indentation, comments, byte-order
+    /// mark, typographer).
+    ///
+    /// Every tool that reads a corpus must be given the same overlay. One
+    /// that is not sees those tags as undeclared: Markdoc renders only their
+    /// content, without their framing or attributes — which is how
+    /// `{% notice %}` came to be a styled callout on the web and bare text
+    /// here.
+    #[arg(long = "schema", value_name = "FILE")]
+    schema: Vec<PathBuf>,
 
     /// Build-time variable, repeatable: `--var key=value`. Exposed to the
     /// document as `$key` in `{% … %}` interpolation, `{% if %}` conditions,
@@ -131,8 +147,23 @@ fn run(args: &Args) -> Result<(), AppError> {
         None => Style::default(),
     };
 
+    // ── Load the schema: markdoc's bundle, markdoc-pdf's own overlay, then
+    //    each `--schema` file in order. It decides how the document is read
+    //    (its `[parse]` / `[render]` tables) as well as what its tags mean.
+    let overlays = args
+        .schema
+        .iter()
+        .map(|path| {
+            fs::read_to_string(path).map_err(|e| AppError::Schema(path.clone(), e.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let overlay_texts: Vec<&str> = overlays.iter().map(String::as_str).collect();
+    let bundle = pipeline::bundle(&overlay_texts)
+        .map_err(|(i, e)| AppError::Schema(args.schema[i].clone(), e))?;
+    let options = pipeline::parse_options(&bundle);
+
     // ── Collect build-time variables (`--variables` file + `--var`). ─
-    let mut cli_vars: HashMap<String, Scalar> = HashMap::new();
+    let mut cli_vars: IndexMap<String, Scalar> = IndexMap::new();
     if let Some(path) = &args.variables {
         if !path.exists() {
             return Err(AppError::VariablesMissing(path.clone()));
@@ -163,20 +194,21 @@ fn run(args: &Args) -> Result<(), AppError> {
     // ── Read + parse the source. ───────────────────────────────────
     let source =
         fs::read_to_string(&args.input).map_err(|e| AppError::Read(args.input.clone(), e))?;
-    // Variables resolve at transform time via Context (below), not at parse.
-    let doc =
-        parse(&source, None).map_err(|e| AppError::Parse(args.input.clone(), e.to_string()))?;
+    // Variables resolve at transform time, from the config (below), not at parse.
+    let doc = pipeline::parse(&source, &options)
+        .map_err(|e| AppError::Parse(args.input.clone(), e.to_string()))?;
 
     // Stitch a composed work together: if the root frontmatter carries a
-    // Flux `sections` manifest, append a `{% partial %}` per section file so
+    // `sections` manifest, append a `{% partial %}` per section file so
     // the partial expansion below includes them all as one book.
     let doc = expand_sections(doc, &args.input);
 
     // Expand `{% partial file="..." /%}` references against the input
     // file's parent directory. Partials' own `{% partial %}` tags are
-    // resolved recursively; cycles are detected and reported. Inline
-    // `{% $var %}` interpolation in a partial / section resolves later,
-    // against the transform Context (which carries the root frontmatter).
+    // resolved recursively; cycles are detected and reported. Each file is
+    // parsed with the document's options. Inline `{% $var %}` interpolation in
+    // a partial / section resolves later, at transform time, against the
+    // root frontmatter.
     let partial_root = args
         .input
         .parent()
@@ -187,77 +219,57 @@ fn run(args: &Args) -> Result<(), AppError> {
             .chain(args.partials_root.iter().cloned())
             .collect(),
     );
-    let doc = expand_partials(&doc, &partial_resolver)
+    let doc = pipeline::expand(&doc, &partial_resolver, &options)
         .map_err(|e| AppError::Partials(args.input.clone(), e.to_string()))?;
+    for problem in pipeline::syntax_errors(&doc, &args.input.display().to_string()) {
+        eprintln!("warning: {problem}");
+    }
 
-    // Expand `{% document-history /%}` into a table built from the composed
-    // document's `documentHistory` frontmatter — after partial expansion so the
-    // tag may live in a partial and still read the root document's history.
-    let doc = expand_document_history(doc);
+    // Expand each tag the style names in `frontmatter_tables` into a heading
+    // and a table built from the composed document's frontmatter — after
+    // partial expansion, so the tag may live in a partial or a section and
+    // still read the root document's list.
+    let doc = expand_frontmatter_tables(doc, &style.frontmatter_tables, &options);
 
-    // Normalise CommonMark footnotes (`[^id]` references + `[^id]:` bodies)
-    // into `{% footnote %}` tags — after partial / section expansion so a
-    // reference and its definition in different files still resolve.
-    let doc = resolve_footnotes(&doc);
-
-    let doc = resolve_crossrefs(&doc);
-    // Seed the evaluation context with the document's own frontmatter, so
-    // conditionals, tag attributes, and inline `{% $var %}` interpolation can
-    // read `$markdoc.frontmatter.*` (e.g. `{% qr
-    // value=$markdoc.frontmatter.documentNumber /%}`). Then overlay build-time
-    // `--var` values as top-level `$key`. Everything resolves here, at
-    // transform time, against this one Context — so a stitched-in section sees
-    // the composed book's frontmatter, not its own dropped header.
-    let base_ctx = match doc.attributes.get("frontmatter") {
-        Some(fm) => Context::new().with_frontmatter(fm.clone()),
-        None => Context::new(),
-    };
-    let ctx = cli_vars
-        .iter()
-        .fold(base_ctx, |c, (k, v)| c.with_variable(k.clone(), v.clone()));
-    let doc = evaluate_conditionals(&doc, &ctx)
-        .map_err(|e| AppError::Conditionals(args.input.clone(), e.to_string()))?;
-    let rendered = transform_with_context(&doc, &Config::default(), &ctx)
+    // Bind the document's own frontmatter, so conditionals, tag attributes,
+    // and inline `{% $var %}` interpolation can read `$markdoc.frontmatter.*`
+    // (e.g. `{% qr value=$markdoc.frontmatter.documentNumber /%}`), and the
+    // build-time `--var` values as top-level `$key`. Everything resolves at
+    // transform time, against this one config — so a stitched-in section
+    // sees the composed book's frontmatter, not its own dropped header.
+    // `{% if %}`, `{% switch %}` and `{% for %}` are decided there too.
+    let config = pipeline::config(&bundle, doc.attributes.get("frontmatter"), &cli_vars);
+    for name in pipeline::unknown_functions(&doc, &config) {
+        eprintln!(
+            "warning: {}: `{name}()` has no code in markdoc-pdf: every call to it is null, \
+             so an {{% if %}} it guards hides its content",
+            args.input.display()
+        );
+    }
+    let rendered = pipeline::transform(&doc, &config)
         .map_err(|e| AppError::Transform(args.input.clone(), e.to_string()))?;
 
     let resolver = FsAssetResolver::new(&assets_root);
 
-    // ── Pull doc metadata from frontmatter. A document with no YAML
-    //    block is fine (fields fall back to defaults), but frontmatter
-    //    that is present yet unparsable is surfaced as a warning rather
-    //    than silently dropped — otherwise a single bad field would
-    //    quietly strip the title, dates and everything else.
-    let fm_opt = match FluxFrontmatter::from_node(&doc) {
-        Ok(fm) => Some(fm),
-        Err(flux_types::FluxError::NoFrontmatter) => None,
-        Err(e) => {
-            eprintln!(
-                "warning: ignoring unparsable frontmatter in {} ({e}); \
-                 title/date metadata may be missing",
-                args.input.display()
-            );
-            None
-        }
-    };
-    let creation_date = fm_opt
-        .as_ref()
-        .and_then(|fm| fm.update_date.as_deref().or(fm.release_date.as_deref()))
+    // ── Pull doc metadata from frontmatter, a field at a time: a field
+    //    YAML read as something else costs that field and never the rest
+    //    (`markdoc_pdf::frontmatter` says why). A document with no
+    //    frontmatter gets every default.
+    let no_frontmatter = frontmatter::Map::new();
+    let fm = frontmatter::of(&doc).unwrap_or(&no_frontmatter);
+    let update_date = frontmatter::field(fm, "updateDate");
+    let release_date = frontmatter::field(fm, "releaseDate");
+    let creation_date = update_date
+        .as_deref()
+        .or(release_date.as_deref())
         .and_then(dates::parse_iso)
         .or_else(|| Some(dates::now()));
-    let authors = fm_opt
-        .as_ref()
-        .map(|fm| fm.authors.clone())
-        .unwrap_or_default();
-    let creator = fm_opt
-        .as_ref()
-        .and_then(|fm| fm.creator.clone())
-        .or_else(|| Some("markdoc-pdf".to_string()));
-    let date_string = fm_opt.as_ref().and_then(|fm| {
-        fm.update_date
-            .as_deref()
-            .or(fm.release_date.as_deref())
-            .map(dates::iso_to_date_only)
-    });
+    let authors = frontmatter::list(fm, "authors");
+    let creator = frontmatter::field(fm, "creator").or_else(|| Some("markdoc-pdf".to_string()));
+    let date_string = update_date
+        .as_deref()
+        .or(release_date.as_deref())
+        .map(dates::iso_to_date_only);
 
     // Expose the document's own frontmatter as template variables for
     // header/footer and cover-page templates (`{version}`, `{language}`,
@@ -272,10 +284,7 @@ fn run(args: &Args) -> Result<(), AppError> {
     // frontmatter field): a single year when the first-release year
     // equals — or is missing for — the current year, otherwise
     // `first–current`.
-    let first_year = fm_opt
-        .as_ref()
-        .and_then(|fm| fm.release_date.as_deref())
-        .and_then(dates::year_of);
+    let first_year = release_date.as_deref().and_then(dates::year_of);
     vars.insert(
         "copyright_years".to_string(),
         dates::copyright_year_span(first_year, dates::current_year()),
@@ -288,12 +297,9 @@ fn run(args: &Args) -> Result<(), AppError> {
 
     let render_ctx = RenderContext {
         external_tagrefs,
-        title: fm_opt
-            .as_ref()
-            .and_then(|fm| fm.title.clone())
-            .unwrap_or_default(),
-        language: fm_opt.as_ref().and_then(|fm| fm.language.clone()),
-        description: fm_opt.as_ref().and_then(|fm| fm.description.clone()),
+        title: frontmatter::field(fm, "title").unwrap_or_default(),
+        language: frontmatter::field(fm, "language"),
+        description: frontmatter::field(fm, "description"),
         authors,
         creator,
         producer: Some(format!("markdoc-pdf {}", env!("CARGO_PKG_VERSION"))),
@@ -316,7 +322,7 @@ fn run(args: &Args) -> Result<(), AppError> {
 }
 
 /// Stitch a composed work together from its `sections` manifest. When the
-/// root document's frontmatter carries a Flux `sections` list — an ordered
+/// root document's frontmatter carries a `sections` list — an ordered
 /// tree of `[section, [subsection, …]]` file paths — append a
 /// `{% partial %}` for each, in order (section then its subsections), after
 /// the root's own content (the copyright page, ToC, …). The partial
@@ -325,10 +331,9 @@ fn run(args: &Args) -> Result<(), AppError> {
 /// recursion + cycle detection. A document with no `sections` (the common
 /// case) is returned unchanged.
 fn expand_sections(mut doc: Node, input: &Path) -> Node {
-    let sections = match FluxFrontmatter::from_node(&doc) {
-        Ok(fm) => fm.sections,
-        Err(_) => return doc, // no / unparsable frontmatter — nothing to stitch
-    };
+    let sections = frontmatter::of(&doc)
+        .map(frontmatter::sections)
+        .unwrap_or_default();
     if sections.is_empty() {
         return doc;
     }
@@ -336,11 +341,9 @@ fn expand_sections(mut doc: Node, input: &Path) -> Node {
     for section in &sections {
         for path in std::iter::once(&section.path).chain(section.subsections.iter()) {
             let file = section_partial_path(path, base);
-            let mut attrs = HashMap::new();
-            attrs.insert("file".to_string(), Scalar::String(file));
             doc.push(Node::new(
                 NodeType::Tag,
-                attrs,
+                [("file".to_string(), Scalar::String(file))],
                 Vec::new(),
                 Some("partial".to_string()),
             ));
@@ -416,10 +419,9 @@ impl PartialResolver for MultiRootPartialResolver {
 }
 
 /// Resolve a `sections` path to a `{% partial %}` `file=` value relative to
-/// the manifest's directory: strip a leading `/` (the Flux example paths are
+/// the manifest's directory: strip a leading `/` (manifest paths may be
 /// document-root-relative, not filesystem-absolute) and, when the path has
-/// no extension, probe `.mdoc`, `.md`, then `.markdoc` (the Flux spec's
-/// extension), defaulting to `.mdoc` so a genuinely missing file surfaces as
+/// no extension, probe `.mdoc`, `.md`, then `.markdoc`, defaulting to `.mdoc` so a genuinely missing file surfaces as
 /// the standard partial-not-found error.
 fn section_partial_path(raw: &str, base: &Path) -> String {
     let rel = raw.trim().trim_start_matches('/');
@@ -435,71 +437,102 @@ fn section_partial_path(raw: &str, base: &Path) -> String {
     format!("{rel}.mdoc")
 }
 
-/// Internal tag name authored as `{% document-history /%}`.
-const DOC_HISTORY_TAG: &str = "document-history";
-
-/// Replace every `{% document-history /%}` with a heading + table built from
-/// the composed document's `documentHistory` frontmatter (typed as
-/// [`HistoryEntry`]). An empty or absent history drops the tag entirely.
-fn expand_document_history(mut doc: Node) -> Node {
-    let history = match FluxFrontmatter::from_node(&doc) {
-        Ok(fm) => fm.document_history,
-        Err(_) => return doc, // no / unparsable frontmatter — nothing to expand
-    };
-    replace_history_tags(&mut doc, &history);
+/// Replace every tag `tables` names with a heading and a table built from the
+/// composed document's frontmatter ([`FrontmatterTable`]): one row per map in
+/// the list the entry names, one column per entry of its `columns`. A tag
+/// whose list is absent or holds no map, or whose entry has no columns, is
+/// removed, heading and all. With no entries the document is unchanged:
+/// markdoc-pdf knows no such tag of its own.
+fn expand_frontmatter_tables(
+    mut doc: Node,
+    tables: &BTreeMap<String, FrontmatterTable>,
+    options: &ParseOptions,
+) -> Node {
+    if tables.is_empty() {
+        return doc;
+    }
+    let no_frontmatter = frontmatter::Map::new();
+    let fm = frontmatter::of(&doc).unwrap_or(&no_frontmatter);
+    let filled: FilledTables = tables
+        .iter()
+        .map(|(name, table)| {
+            let fields: Vec<&str> = table.columns.iter().map(|c| c.field.as_str()).collect();
+            let rows = frontmatter::rows(fm, &table.key, &fields);
+            (name.as_str(), (table, rows))
+        })
+        .collect();
+    replace_table_tags(&mut doc, &filled, options);
     doc
 }
 
-fn replace_history_tags(node: &mut Node, history: &[HistoryEntry]) {
+/// Each configured tag's entry with the rows its list holds in this document.
+type FilledTables<'a> = BTreeMap<&'a str, (&'a FrontmatterTable, Vec<Vec<Option<String>>>)>;
+
+fn replace_table_tags(node: &mut Node, tables: &FilledTables, options: &ParseOptions) {
     let mut i = 0;
     while i < node.children.len() {
         let child = &node.children[i];
-        if child.node_type == NodeType::Tag && child.tag.as_deref() == Some(DOC_HISTORY_TAG) {
-            let title = match child.attributes.get("title") {
-                Some(Scalar::String(s)) => Some(s.clone()),
-                _ => None,
+        let entry = match child.tag.as_deref() {
+            Some(name) if child.node_type == NodeType::Tag => tables.get(name),
+            _ => None,
+        };
+        if let Some((table, rows)) = entry {
+            let heading = match child.attributes.get("title") {
+                Some(Scalar::String(title)) => Some(title.as_str()),
+                _ => table.heading.as_deref(),
             };
-            let replacement = document_history_nodes(history, title.as_deref());
+            let replacement = frontmatter_table_nodes(table, rows, heading, options);
             let n = replacement.len();
             node.children.splice(i..=i, replacement);
             i += n; // skip the generated nodes (don't recurse into them)
         } else {
-            replace_history_tags(&mut node.children[i], history);
+            replace_table_tags(&mut node.children[i], tables, options);
             i += 1;
         }
     }
 }
 
-/// Build the heading + table nodes for a document history by generating the
-/// equivalent Markdoc source and re-parsing it — the parser produces exactly
-/// the node shapes the table renderer expects, and cell text is `|`-escaped.
-/// An empty history yields nothing (the tag is simply removed).
-fn document_history_nodes(history: &[HistoryEntry], title: Option<&str>) -> Vec<Node> {
-    if history.is_empty() {
+/// Build the heading + table nodes for one table by generating the equivalent
+/// Markdoc source and re-parsing it — the parser produces exactly the node
+/// shapes the table renderer expects, and cell text is `|`-escaped. No rows,
+/// or no columns, yield nothing (the tag is simply removed); an empty
+/// `heading` sets none.
+fn frontmatter_table_nodes(
+    table: &FrontmatterTable,
+    rows: &[Vec<Option<String>>],
+    heading: Option<&str>,
+    options: &ParseOptions,
+) -> Vec<Node> {
+    if rows.is_empty() || table.columns.is_empty() {
         return Vec::new();
     }
-    let mut src = String::new();
-    match title {
-        Some("") => {} // caller asked for no heading
-        Some(t) => src.push_str(&format!("## {t}\n\n")),
-        None => src.push_str("## Document history\n\n"),
-    }
-    src.push_str("| Version | Date | Description |\n| --- | --- | --- |\n");
-    let cell = |v: &Option<String>| {
-        v.as_deref()
-            .unwrap_or("")
-            .replace('|', "\\|")
-            .replace('\n', " ")
+    let cell = |text: &str| text.replace('|', "\\|").replace('\n', " ");
+    let line = |cells: &mut dyn Iterator<Item = String>| {
+        let mut out = String::from("|");
+        for text in cells {
+            out.push(' ');
+            out.push_str(&text);
+            out.push_str(" |");
+        }
+        out.push('\n');
+        out
     };
-    for e in history {
-        src.push_str(&format!(
-            "| {} | {} | {} |\n",
-            cell(&e.version),
-            cell(&e.date),
-            cell(&e.description)
+    let mut src = String::new();
+    if let Some(heading) = heading.filter(|h| !h.is_empty()) {
+        src.push_str(&format!("## {heading}\n\n"));
+    }
+    src.push_str(&line(&mut table.columns.iter().map(|c| cell(&c.header))));
+    src.push_str(&line(&mut table.columns.iter().map(|_| "---".to_string())));
+    for row in rows {
+        src.push_str(&line(
+            &mut row.iter().map(|v| cell(v.as_deref().unwrap_or(""))),
         ));
     }
-    parse(&src, None).map(|d| d.children).unwrap_or_default()
+    // Generated text, spliced in after the syntax errors were reported:
+    // nothing reads its positions, so it is parsed without them.
+    pipeline::parse(&src, &options.with_spans(false))
+        .map(|mut d| std::mem::take(&mut d.children))
+        .unwrap_or_default()
 }
 
 /// Convert a JSON value from `--variables` into Markdoc's `Scalar` type.
@@ -580,17 +613,11 @@ fn collect_frontmatter_vars(doc: &markdoc::ast::Node, vars: &mut HashMap<String,
     }
 }
 
-/// Render a scalar as a flat template string. Whole-number floats print
-/// without a fractional part (YAML integers arrive as `f64`). Arrays of
-/// scalars join with `", "`. Objects, nested arrays, null, and empty
-/// values yield `None`.
+/// Render a scalar as a flat template string, as [`frontmatter::text`]
+/// reads one. Arrays of scalars join with `", "`; objects, nested arrays,
+/// null and empty values yield `None`.
 fn scalar_to_template_string(value: &Scalar) -> Option<String> {
     match value {
-        Scalar::String(s) if !s.trim().is_empty() => Some(s.clone()),
-        Scalar::String(_) => None,
-        Scalar::Number(n) if n.is_finite() && n.fract() == 0.0 => Some(format!("{}", *n as i64)),
-        Scalar::Number(n) => Some(n.to_string()),
-        Scalar::Boolean(b) => Some(b.to_string()),
         Scalar::Array(items) => {
             // Only flat lists of scalars (e.g. `products`, `orderNumber`).
             // `documentHistory` (array of objects) stays out of templates.
@@ -600,14 +627,14 @@ fn scalar_to_template_string(value: &Scalar) -> Option<String> {
             {
                 return None;
             }
-            let parts: Vec<String> = items.iter().filter_map(scalar_to_template_string).collect();
+            let parts: Vec<String> = items.iter().filter_map(frontmatter::text).collect();
             if parts.is_empty() {
                 None
             } else {
                 Some(parts.join(", "))
             }
         }
-        Scalar::Null | Scalar::Object(_) => None,
+        other => frontmatter::text(other),
     }
 }
 
@@ -622,6 +649,7 @@ enum AppError {
     OutputDirMissing(PathBuf),
     AssetsRootMissing(PathBuf),
     StyleLoad(PathBuf, String),
+    Schema(PathBuf, String),
     VariablesMissing(PathBuf),
     VariablesLoad(PathBuf, String),
     ExternalTagrefs(PathBuf, String),
@@ -629,7 +657,6 @@ enum AppError {
     Write(PathBuf, std::io::Error),
     Parse(PathBuf, String),
     Partials(PathBuf, String),
-    Conditionals(PathBuf, String),
     Transform(PathBuf, String),
     Render(PathBuf, String),
 }
@@ -655,8 +682,12 @@ impl AppError {
             AppError::StyleLoad(_, _) => vec![
                 "if you're new to the style format, copy markdoc-pdf/examples/themes/letter.style.toml and edit.".into(),
             ],
+            AppError::Schema(_, _) => vec![
+                "--schema takes a tag overlay in markdoc's schema format; a corpus usually keeps one beside its content.".into(),
+                "every tool reading that corpus must be given the same file, or they disagree about what a tag means.".into(),
+            ],
             AppError::Parse(_, _) => vec![
-                "Markdoc parses CommonMark plus {% tag %} extensions. Common gotchas: unbalanced tags, missing /%} on self-closing tags.".into(),
+                "markdoc stops a parse only past its nesting limits, or on a tag it cannot place (a class given twice, a tag closed inside a link's label).".into(),
             ],
             AppError::Partials(_, msg) if msg.contains("cycle") => vec![
                 "two or more partials include each other transitively — break the loop or extract the shared content into a third file.".into(),
@@ -664,11 +695,8 @@ impl AppError {
             AppError::Partials(_, _) => vec![
                 "partial paths are resolved against the input file's directory; check spelling and that the file exists.".into(),
             ],
-            AppError::Conditionals(_, _) => vec![
-                "{% if expr %} branches must reference variables defined in frontmatter, via --var / --variables, or via Context.".into(),
-            ],
             AppError::Transform(_, _) => vec![
-                "transform errors usually mean a tag failed schema validation — check the spelling and required attributes.".into(),
+                "a {% for %} loops over an array (frontmatter, --var / --variables); its as= and index= name the loop variables.".into(),
             ],
             _ => Vec::new(),
         }
@@ -689,6 +717,9 @@ impl std::fmt::Display for AppError {
             AppError::StyleLoad(p, msg) => {
                 write!(f, "couldn't load style {}: {msg}", p.display())
             }
+            AppError::Schema(p, msg) => {
+                write!(f, "couldn't load tag schema {}: {msg}", p.display())
+            }
             AppError::VariablesMissing(p) => {
                 write!(f, "variables file not found: {}", p.display())
             }
@@ -703,9 +734,6 @@ impl std::fmt::Display for AppError {
             AppError::Parse(p, e) => write!(f, "couldn't parse {}: {e}", p.display()),
             AppError::Partials(p, e) => {
                 write!(f, "partial expansion failed for {}: {e}", p.display())
-            }
-            AppError::Conditionals(p, e) => {
-                write!(f, "conditional evaluation failed in {}: {e}", p.display())
             }
             AppError::Render(p, e) => {
                 write!(f, "rendering {} failed: {e}", p.display())
@@ -726,6 +754,14 @@ fn _unused(_: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(source: &str) -> Node {
+        pipeline::parse(
+            source,
+            &pipeline::parse_options(&pipeline::bundle(&[]).unwrap()),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn scalar_strings_and_bools() {
@@ -762,14 +798,12 @@ mod tests {
         assert_eq!(scalar_to_template_string(&Scalar::Null), None);
         assert_eq!(scalar_to_template_string(&Scalar::Array(vec![])), None);
         assert_eq!(
-            scalar_to_template_string(&Scalar::Object(std::collections::HashMap::new())),
+            scalar_to_template_string(&Scalar::Object(IndexMap::new())),
             None
         );
         // Arrays of objects (e.g. documentHistory) are not flattened.
         assert_eq!(
-            scalar_to_template_string(&Scalar::Array(vec![Scalar::Object(
-                std::collections::HashMap::new()
-            )])),
+            scalar_to_template_string(&Scalar::Array(vec![Scalar::Object(IndexMap::new())])),
             None
         );
     }
@@ -777,17 +811,17 @@ mod tests {
     #[test]
     fn scalar_arrays_join_with_comma() {
         assert_eq!(
-            scalar_to_template_string(&Scalar::Array(vec![Scalar::String("MiR250".into())]))
+            scalar_to_template_string(&Scalar::Array(vec![Scalar::String("Bot250".into())]))
                 .as_deref(),
-            Some("MiR250")
+            Some("Bot250")
         );
         assert_eq!(
             scalar_to_template_string(&Scalar::Array(vec![
-                Scalar::String("MiR250".into()),
-                Scalar::String("MiR600".into()),
+                Scalar::String("Bot250".into()),
+                Scalar::String("Bot600".into()),
             ]))
             .as_deref(),
-            Some("MiR250, MiR600")
+            Some("Bot250, Bot600")
         );
         // YAML integers in orderNumber lists.
         assert_eq!(
@@ -809,7 +843,7 @@ mod tests {
             section_partial_path("/manual/safety/x", base),
             "manual/safety/x.mdoc"
         );
-        // An explicit extension is preserved — including Flux's `.markdoc`.
+        // An explicit extension is preserved — including `.markdoc`.
         assert_eq!(section_partial_path("a/b.md", base), "a/b.md");
         assert_eq!(section_partial_path("a/b.markdoc", base), "a/b.markdoc");
     }
@@ -852,7 +886,7 @@ sections:
 
 # Copyright
 "#;
-        let doc = markdoc::parser::parse(src, None).unwrap();
+        let doc = parse(src);
         let before = doc.children.len();
         let out = expand_sections(doc, Path::new("book.mdoc"));
         let partials: Vec<&str> = out
@@ -877,9 +911,174 @@ sections:
         assert_eq!(out.children.len(), before + 4);
     }
 
+    /// A revision-history table configured the way a corpus would.
+    const HISTORY_STYLE: &str = r#"
+[frontmatter_tables.document-history]
+key = "documentHistory"
+heading = "Document history"
+columns = [
+  { field = "version", header = "Version" },
+  { field = "date", header = "Date" },
+  { field = "description", header = "Description" },
+]
+"#;
+
+    const HISTORY_FRONTMATTER: &str = r#"---
+title: Book
+documentHistory:
+  - version: "3.0"
+    date: "2026-06-01"
+    description: "Pipes | and
+      a folded line"
+  - version: 2.0
+    date: "2025-01-01"
+  - "not a map"
+---
+"#;
+
+    fn tables(style: &str) -> BTreeMap<String, FrontmatterTable> {
+        Style::from_toml_str(style).unwrap().frontmatter_tables
+    }
+
+    fn options() -> ParseOptions {
+        pipeline::parse_options(&pipeline::bundle(&[]).unwrap())
+    }
+
+    /// The children of `doc` as JSON, to compare trees.
+    fn tree(nodes: &[Node]) -> serde_json::Value {
+        serde_json::to_value(nodes).unwrap()
+    }
+
+    /// What `source` parses to as generated text (no positions).
+    fn generated(source: &str) -> serde_json::Value {
+        let doc = pipeline::parse(source, &options().with_spans(false)).unwrap();
+        tree(&doc.children)
+    }
+
+    #[test]
+    fn a_configured_tag_becomes_a_heading_and_a_table() {
+        let doc = parse(&format!(
+            "{HISTORY_FRONTMATTER}\n{{% document-history /%}}\n"
+        ));
+        let out = expand_frontmatter_tables(doc, &tables(HISTORY_STYLE), &options());
+        // The Markdoc source the built-in `{% document-history /%}` generated
+        // for this frontmatter before the tag became a style's, byte for byte.
+        assert_eq!(
+            tree(&out.children),
+            generated(
+                "## Document history\n\n\
+                 | Version | Date | Description |\n\
+                 | --- | --- | --- |\n\
+                 | 3.0 | 2026-06-01 | Pipes \\| and a folded line |\n\
+                 | 2 | 2025-01-01 |  |\n"
+            )
+        );
+    }
+
+    #[test]
+    fn the_title_attribute_replaces_the_heading_and_an_empty_one_drops_it() {
+        let table = "| Version | Date | Description |\n\
+                     | --- | --- | --- |\n\
+                     | 3.0 | 2026-06-01 | Pipes \\| and a folded line |\n\
+                     | 2 | 2025-01-01 |  |\n";
+        let doc = parse(&format!(
+            "{HISTORY_FRONTMATTER}\n{{% document-history title=\"Revision log\" /%}}\n"
+        ));
+        let out = expand_frontmatter_tables(doc, &tables(HISTORY_STYLE), &options());
+        assert_eq!(
+            tree(&out.children),
+            generated(&format!("## Revision log\n\n{table}"))
+        );
+
+        let doc = parse(&format!(
+            "{HISTORY_FRONTMATTER}\n{{% document-history title=\"\" /%}}\n"
+        ));
+        let out = expand_frontmatter_tables(doc, &tables(HISTORY_STYLE), &options());
+        assert_eq!(tree(&out.children), generated(table));
+
+        // A style without a heading sets none unless the tag asks for one.
+        let headless = HISTORY_STYLE.replace("heading = \"Document history\"\n", "");
+        let doc = parse(&format!(
+            "{HISTORY_FRONTMATTER}\n{{% document-history /%}}\n"
+        ));
+        let out = expand_frontmatter_tables(doc, &tables(&headless), &options());
+        assert_eq!(tree(&out.children), generated(table));
+    }
+
+    #[test]
+    fn without_configuration_markdoc_pdf_knows_no_such_tag() {
+        let source = format!("{HISTORY_FRONTMATTER}\n# Body\n\n{{% document-history /%}}\n");
+        let doc = parse(&source);
+        let before = tree(&doc.children);
+        let out = expand_frontmatter_tables(doc, &BTreeMap::new(), &options());
+        assert_eq!(tree(&out.children), before, "the document is untouched");
+        assert!(
+            out.walk()
+                .any(|n| n.tag.as_deref() == Some("document-history")),
+            "the tag is left for Markdoc to render, as any undeclared tag"
+        );
+        assert!(!out.walk().any(|n| n.node_type == NodeType::Table));
+    }
+
+    #[test]
+    fn the_tag_name_list_and_columns_are_the_styles_own() {
+        let style = r#"
+[frontmatter_tables.changes]
+key = "changeLog"
+heading = "Changes"
+columns = [{ field = "who", header = "Who" }, { field = "when", header = "When" }]
+"#;
+        let source = r#"---
+changeLog:
+  - when: "2024"
+    who: "A. Writer"
+documentHistory:
+  - version: "1.0"
+---
+
+{% changes /%}
+
+{% document-history /%}
+"#;
+        let out = expand_frontmatter_tables(parse(source), &tables(style), &options());
+        let expected =
+            generated("## Changes\n\n| Who | When |\n| --- | --- |\n| A. Writer | 2024 |\n");
+        assert_eq!(tree(&out.children[..2]), expected);
+        // `document-history` is named nowhere in this style: it stays a tag.
+        assert_eq!(out.children.len(), 3);
+        assert_eq!(out.children[2].tag.as_deref(), Some("document-history"));
+    }
+
+    #[test]
+    fn a_tag_inside_another_tag_is_expanded_too() {
+        let source = format!(
+            "{HISTORY_FRONTMATTER}\n{{% if true %}}\n{{% document-history title=\"\" /%}}\n{{% /if %}}\n"
+        );
+        let out = expand_frontmatter_tables(parse(&source), &tables(HISTORY_STYLE), &options());
+        assert!(out.walk().any(|n| n.node_type == NodeType::Table));
+        assert!(
+            !out.walk()
+                .any(|n| n.tag.as_deref() == Some("document-history"))
+        );
+    }
+
+    #[test]
+    fn no_rows_or_no_columns_remove_the_tag_and_its_heading() {
+        let doc = parse("---\ntitle: No history\n---\n\n{% document-history /%}\n");
+        let out = expand_frontmatter_tables(doc, &tables(HISTORY_STYLE), &options());
+        assert!(out.children.is_empty());
+
+        let no_columns = "[frontmatter_tables.document-history]\nkey = \"documentHistory\"\nheading = \"H\"\ncolumns = []\n";
+        let doc = parse(&format!(
+            "{HISTORY_FRONTMATTER}\n{{% document-history /%}}\n"
+        ));
+        let out = expand_frontmatter_tables(doc, &tables(no_columns), &options());
+        assert!(out.children.is_empty());
+    }
+
     #[test]
     fn expand_sections_noop_without_manifest() {
-        let doc = markdoc::parser::parse("---\ntitle: Plain\n---\n\n# Body\n", None).unwrap();
+        let doc = parse("---\ntitle: Plain\n---\n\n# Body\n");
         let before = doc.children.len();
         let out = expand_sections(doc, Path::new("d.mdoc"));
         assert_eq!(out.children.len(), before);

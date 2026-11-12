@@ -1,0 +1,16 @@
+# The `{% document-history /%}` tag of examples/document-history.mdoc.
+#
+# markdoc-pdf knows no such tag of its own: a style names it under
+# `[frontmatter_tables]`, with the frontmatter list its rows come from, the
+# heading above it and its columns (the key each cell is read from and the
+# header above it). Without this file the tag renders nothing. Everything
+# else is the built-in default style.
+
+[frontmatter_tables.document-history]
+key = "documentHistory"
+heading = "Document history"
+columns = [
+  { field = "version", header = "Version" },
+  { field = "date", header = "Date" },
+  { field = "description", header = "Description" },
+]

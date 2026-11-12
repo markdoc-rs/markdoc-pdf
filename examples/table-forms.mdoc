@@ -29,15 +29,19 @@ Leave the header row blank (`| | |`) and it is dropped, leaving a plain grid.
 
 ## Header column (row headers)
 
-Wrap the table in a `table` tag with `header_column=true` to turn the first
-column into row headers (bold + shaded).
+Write the table as a list-syntax `table` tag with `header_column=true` to
+turn the first column into row headers (bold + shaded).
 
 {% table header_column=true %}
-| | |
-|---------|------------|
-| Date    | 2026-05-20 |
-| Version | 3.9.0      |
-| Author  | MiR        |
+---
+* Date
+* 2026-05-20
+---
+* Version
+* 3.9.0
+---
+* Author
+* Acme
 {% /table %}
 
 ## Text alignment

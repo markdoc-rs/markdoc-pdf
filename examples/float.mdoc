@@ -4,8 +4,8 @@ title: Text wrapping with float
 
 # Wrapping content around an image
 
-The `\{% float %}` container places an image on one side and flows the
-following content around it. Unlike `\{% columns %}`, which lays out
+The `{% float %}` container places an image on one side and flows the
+following content around it. Unlike `{% columns %}`, which lays out
 independent side-by-side lanes, a float is a single flow: each block hugs
 the image's near edge while it overlaps, then spans the full column once it
 clears the image's bottom edge. The whole construct stays on one page — if
@@ -58,7 +58,7 @@ section ends on the normal measure.
 
 ## Multiple anchored floats (magazine)
 
-Give each `\{% media %}` an explicit `side` and drop it *inline*, at the point
+Give each `{% media %}` an explicit `side` and drop it *inline*, at the point
 in the prose where it should anchor. The whole region becomes one continuous
 text stream that wraps around every float — narrowing on the left past a
 `side="left"` image, on the right before a `side="right"` one, and into the
