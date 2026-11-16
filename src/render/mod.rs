@@ -25,6 +25,7 @@ mod paginate;
 pub mod style;
 mod text;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use krilla::Document;
@@ -116,6 +117,13 @@ impl TemplateContext<'_> {
     /// `{section}`, `{date}` into a template string. Unknown `{vars}`
     /// are left as-is so authors can spot typos in their templates.
     pub fn substitute(&self, template: &str) -> String {
+        self.substitute_inspect(template, |_| {})
+    }
+
+    /// [`substitute`](Self::substitute), handing `inspect` the value of
+    /// each token it replaces. An unknown token is left literal and is not
+    /// handed over.
+    pub fn substitute_inspect(&self, template: &str, mut inspect: impl FnMut(&str)) -> String {
         let mut out = String::with_capacity(template.len());
         let mut chars = template.chars().peekable();
         while let Some(c) = chars.next() {
@@ -137,22 +145,26 @@ impl TemplateContext<'_> {
                 out.push_str(&name);
                 continue;
             }
-            match name.as_str() {
-                "page" => out.push_str(&self.page.to_string()),
-                "total" => out.push_str(&self.total.to_string()),
-                "title" => out.push_str(self.title),
-                "chapter" => out.push_str(self.chapter),
-                "section" => out.push_str(self.section),
-                "date" => out.push_str(self.date),
-                other => match self.vars.get(other) {
-                    Some(v) => out.push_str(v),
-                    None => {
-                        // Unknown — leave literal so typos are visible.
-                        out.push('{');
-                        out.push_str(&name);
-                        out.push('}');
-                    }
-                },
+            let value: Option<Cow<'_, str>> = match name.as_str() {
+                "page" => Some(self.page.to_string().into()),
+                "total" => Some(self.total.to_string().into()),
+                "title" => Some(self.title.into()),
+                "chapter" => Some(self.chapter.into()),
+                "section" => Some(self.section.into()),
+                "date" => Some(self.date.into()),
+                other => self.vars.get(other).map(|v| v.as_str().into()),
+            };
+            match value {
+                Some(v) => {
+                    inspect(&v);
+                    out.push_str(&v);
+                }
+                None => {
+                    // Unknown — leave literal so typos are visible.
+                    out.push('{');
+                    out.push_str(&name);
+                    out.push('}');
+                }
             }
         }
         out
@@ -1416,8 +1428,32 @@ fn padding_page_count(content_pages: usize, multiple: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::padding_page_count;
+    use std::collections::HashMap;
+
     use super::style::Style;
+    use super::{TemplateContext, padding_page_count};
+
+    #[test]
+    fn substitute_inspect_hands_over_each_replaced_value() {
+        let vars = HashMap::from([("documentNumber".to_string(), "0".to_string())]);
+        let tctx = TemplateContext {
+            page: 3,
+            total: 4,
+            title: "Product guide",
+            chapter: "",
+            section: "",
+            date: "2026-01-15",
+            vars: &vars,
+        };
+        let template = "{title} {documentNumber} p.{page} {chapter}{unknown}";
+        let mut seen = Vec::new();
+        let text = tctx.substitute_inspect(template, |v| seen.push(v.to_string()));
+        // An unknown token stays literal, as `substitute` leaves it, and is
+        // the one token not handed over.
+        assert_eq!(text, "Product guide 0 p.3 {unknown}");
+        assert_eq!(text, tctx.substitute(template));
+        assert_eq!(seen, ["Product guide", "0", "3", ""]);
+    }
 
     #[test]
     fn padding_page_count_even_and_booklet() {

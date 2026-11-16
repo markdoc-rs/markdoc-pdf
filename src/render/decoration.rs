@@ -23,7 +23,7 @@ use parley::layout::Alignment;
 use crate::assets::{AssetResolver, MediaFormat, sniff_format};
 
 use super::TemplateContext;
-use super::style::{HeaderFooterStyle, LogoSpec, Style};
+use super::style::{HeaderFooterStyle, LastPageQr, LogoSpec, Style};
 use super::text::{TextStyle, build_layout, build_layout_aligned, emit_layout};
 
 /// A decoded image / SVG asset ready to draw. Raster formats are
@@ -131,15 +131,15 @@ pub fn emit_footer(
 /// the page (left / centre / right per `spec.align`), above a `spec.label`
 /// caption. Silently does nothing
 /// when the value template leaves an unresolved `{token}` (e.g. the document
-/// has no `documentNumber`) or resolves to empty — so it is safe to enable
-/// document-wide. Tagged as an artifact: it is production metadata, not
-/// reading-order content.
+/// has no `documentNumber`), uses a field set to one of `spec.missing_values`,
+/// or resolves to empty — so it is safe to enable document-wide. Tagged as an
+/// artifact: it is production metadata, not reading-order content.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_last_page_qr(
     surface: &mut krilla::surface::Surface<'_>,
     style: &Style,
     families: &'static [&'static str],
-    spec: &super::style::LastPageQr,
+    spec: &LastPageQr,
     tctx: &TemplateContext<'_>,
     font_cx: &mut FontContext,
     layout_cx: &mut LayoutContext<krilla::color::rgb::Color>,
@@ -149,16 +149,14 @@ pub fn emit_last_page_qr(
     if spec.size <= 0.0 {
         return;
     }
-    let value = tctx.substitute(&spec.value);
-    let value = value.trim();
-    if value.is_empty() || value.contains('{') {
-        return; // unresolved field or empty — nothing to stamp
-    }
+    let Some((value, label)) = last_page_qr_text(spec, tctx) else {
+        return; // a field unset or missing, or empty — nothing to stamp
+    };
     let dark = format!(
         "#{:02x}{:02x}{:02x}",
         spec.color.r, spec.color.g, spec.color.b
     );
-    let Some(svg) = super::block::qr_svg_string(value, &spec.ecl, 4, &dark, "#ffffff") else {
+    let Some(svg) = super::block::qr_svg_string(&value, &spec.ecl, 4, &dark, "#ffffff") else {
         return; // value too long to encode
     };
     let Ok(tree) = SvgTree::from_data(svg.as_bytes(), &usvg::Options::default()) else {
@@ -169,9 +167,7 @@ pub fn emit_last_page_qr(
     };
 
     // Optional human-readable caption below the code.
-    let label = tctx.substitute(&spec.label);
-    let label = label.trim();
-    let has_label = !label.is_empty() && !label.contains('{');
+    let has_label = label.is_some();
     let label_gap = if has_label { 3.0 } else { 0.0 };
     let label_h = if has_label {
         spec.label_font_size * 1.25
@@ -198,7 +194,7 @@ pub fn emit_last_page_qr(
     surface.draw_svg(&tree, qr_size, SvgSettings::default());
     surface.pop();
 
-    if has_label {
+    if let Some(label) = label.as_deref() {
         let text_style = TextStyle {
             font_size: spec.label_font_size,
             font_weight: 400.0,
@@ -232,6 +228,29 @@ pub fn emit_last_page_qr(
     if tagged {
         surface.end_tagged();
     }
+}
+
+/// What the last-page QR stamp shows: the text the code encodes and its
+/// caption (`None` hides the caption), or `None` when there is nothing to
+/// stamp. Each template goes through [`stamp_text`], so a field that is
+/// unset or missing in `value` skips the code and caption together, and
+/// one in `label` hides only the caption.
+fn last_page_qr_text(
+    spec: &LastPageQr,
+    tctx: &TemplateContext<'_>,
+) -> Option<(String, Option<String>)> {
+    let value = stamp_text(spec, tctx, &spec.value)?;
+    Some((value, stamp_text(spec, tctx, &spec.label)))
+}
+
+/// `template` resolved and trimmed, or `None` when it leaves a `{token}`
+/// unresolved (the field is not set), uses a field set to one of
+/// `spec.missing_values`, or comes out empty.
+fn stamp_text(spec: &LastPageQr, tctx: &TemplateContext<'_>, template: &str) -> Option<String> {
+    let mut missing = false;
+    let text = tctx.substitute_inspect(template, |value| missing |= spec.is_missing(value));
+    let text = text.trim();
+    (!missing && !text.is_empty() && !text.contains('{')).then(|| text.to_string())
 }
 
 /// Draw the notice masthead at the top of a page, starting at `band_top`.
@@ -786,4 +805,140 @@ fn draw_rule(
     // Suppress unused-Point/PathBuilder warnings when nothing draws.
     let _ = Point::from_xy(0.0, 0.0);
     let _ = PathBuilder::new();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::super::TemplateContext;
+    use super::super::style::LastPageQr;
+    use super::last_page_qr_text;
+
+    /// A document's fields, as the caller hands them to the renderer.
+    fn fields(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The last page of a four-page document with `vars` as its fields.
+    fn last_page(vars: &HashMap<String, String>) -> TemplateContext<'_> {
+        TemplateContext {
+            page: 4,
+            total: 4,
+            title: "Product guide",
+            chapter: "Reference",
+            section: "",
+            date: "2026-01-15",
+            vars,
+        }
+    }
+
+    /// A stamp that encodes a link to the online copy of the document.
+    fn link_stamp(missing_values: &[&str]) -> LastPageQr {
+        LastPageQr {
+            value: "https://docs.example.com/d/{documentNumber}?lang={language}".into(),
+            missing_values: missing_values.iter().map(|m| m.to_string()).collect(),
+            ..LastPageQr::default()
+        }
+    }
+
+    fn stamped(value: &str, label: Option<&str>) -> Option<(String, Option<String>)> {
+        Some((value.to_string(), label.map(str::to_string)))
+    }
+
+    #[test]
+    fn a_real_value_stamps_the_whole_value_template() {
+        let vars = fields(&[("documentNumber", "1234567"), ("language", "en")]);
+        assert_eq!(
+            last_page_qr_text(&link_stamp(&["0", "n/a"]), &last_page(&vars)),
+            stamped(
+                "https://docs.example.com/d/1234567?lang=en",
+                Some("1234567")
+            )
+        );
+    }
+
+    #[test]
+    fn a_missing_value_skips_the_code_and_its_caption() {
+        let stamp = link_stamp(&["0", "n/a"]);
+        let placeholder = fields(&[("documentNumber", "0"), ("language", "en")]);
+        assert_eq!(last_page_qr_text(&stamp, &last_page(&placeholder)), None);
+        // Exactly what a document without the field gets.
+        let unset = fields(&[("language", "en")]);
+        assert_eq!(last_page_qr_text(&stamp, &last_page(&unset)), None);
+    }
+
+    #[test]
+    fn every_token_in_the_value_is_checked() {
+        let vars = fields(&[("documentNumber", "1234567"), ("language", "N/A")]);
+        assert_eq!(
+            last_page_qr_text(&link_stamp(&["0", "n/a"]), &last_page(&vars)),
+            None
+        );
+        // The built-in tokens are checked the same way, `{chapter}` here.
+        let stamp = LastPageQr {
+            value: "{documentNumber} {chapter}".into(),
+            missing_values: vec!["reference".into()],
+            ..LastPageQr::default()
+        };
+        let vars = fields(&[("documentNumber", "1234567")]);
+        assert_eq!(last_page_qr_text(&stamp, &last_page(&vars)), None);
+    }
+
+    #[test]
+    fn a_missing_value_in_the_label_hides_only_the_caption() {
+        let stamp = LastPageQr {
+            label: "{documentNumber} rev. {revision}".into(),
+            ..link_stamp(&["n/a"])
+        };
+        let vars = fields(&[
+            ("documentNumber", "1234567"),
+            ("language", "en"),
+            ("revision", " n/a "),
+        ]);
+        assert_eq!(
+            last_page_qr_text(&stamp, &last_page(&vars)),
+            stamped("https://docs.example.com/d/1234567?lang=en", None)
+        );
+    }
+
+    #[test]
+    fn without_missing_values_every_value_is_stamped_as_before() {
+        let vars = fields(&[("documentNumber", "0")]);
+        assert_eq!(
+            last_page_qr_text(&LastPageQr::default(), &last_page(&vars)),
+            stamped("0", Some("0"))
+        );
+        // And an unset field or a template that comes out empty still
+        // skips the stamp.
+        assert_eq!(
+            last_page_qr_text(&LastPageQr::default(), &last_page(&fields(&[]))),
+            None
+        );
+        let blank = LastPageQr {
+            value: " {chapter_note} ".into(),
+            ..LastPageQr::default()
+        };
+        let vars = fields(&[("chapter_note", " ")]);
+        assert_eq!(last_page_qr_text(&blank, &last_page(&vars)), None);
+    }
+
+    #[test]
+    fn a_missing_value_only_matches_a_whole_field() {
+        let stamp = link_stamp(&["0"]);
+        for number in ["10", "00", "0.5", "0, 1234567"] {
+            let vars = fields(&[("documentNumber", number), ("language", "en")]);
+            assert_eq!(
+                last_page_qr_text(&stamp, &last_page(&vars)),
+                stamped(
+                    &format!("https://docs.example.com/d/{number}?lang=en"),
+                    Some(number)
+                ),
+                "{number:?} is a real value"
+            );
+        }
+    }
 }

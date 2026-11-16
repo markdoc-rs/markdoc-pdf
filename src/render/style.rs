@@ -1374,7 +1374,8 @@ pub struct PageDecorationStyle {
 /// templates (default `"{documentNumber}"`, resolved against the document's
 /// frontmatter and the usual `{page}`/`{title}`/… tokens); a `value` that
 /// doesn't resolve (no such field) skips the stamp entirely, and an empty
-/// resolved `label` hides the caption.
+/// resolved `label` hides the caption. A field whose value is one of
+/// `missing_values` counts as not set.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LastPageQr {
@@ -1382,6 +1383,12 @@ pub struct LastPageQr {
     pub value: String,
     /// Template for the caption drawn beneath the code (empty hides it).
     pub label: String,
+    /// Values that mean a field is not set, such as a document number of
+    /// `0` until one is assigned. A `{token}` holding one counts as
+    /// unresolved: in `value` it skips the stamp, in `label` it hides the
+    /// caption. Matched against the token's whole value, trimmed, ignoring
+    /// case. Empty (the default) treats every value as real.
+    pub missing_values: Vec<String>,
     /// Rendered side length of the code, in points.
     pub size: f32,
     /// Error-correction level: `low` | `medium` | `quartile` | `high`.
@@ -1426,6 +1433,7 @@ impl Default for LastPageQr {
             font_families: Vec::new(),
             value: "{documentNumber}".to_string(),
             label: "{documentNumber}".to_string(),
+            missing_values: Vec::new(),
             size: 54.0,
             ecl: "medium".to_string(),
             align: "right".to_string(),
@@ -1436,6 +1444,17 @@ impl Default for LastPageQr {
             label_font_size: 8.0,
             include_padding_page: false,
         }
+    }
+}
+
+impl LastPageQr {
+    /// Whether `value` is one of [`missing_values`](Self::missing_values):
+    /// equal to one of them once both are trimmed, ignoring case.
+    pub fn is_missing(&self, value: &str) -> bool {
+        let value = value.trim().to_lowercase();
+        self.missing_values
+            .iter()
+            .any(|missing| missing.trim().to_lowercase() == value)
     }
 }
 
@@ -1926,5 +1945,37 @@ src = "{title}.png"
         assert_eq!(hero.src, "{title}.png");
         assert_eq!(hero.width, 0.0);
         assert_eq!(hero.height, 0.0);
+    }
+
+    #[test]
+    fn last_page_qr_missing_values_default_to_none() {
+        let qr = Style::from_toml_str("[page_decoration.last_page_qr]\n")
+            .unwrap()
+            .page_decoration
+            .last_page_qr
+            .expect("the table enables the stamp");
+        assert!(qr.missing_values.is_empty());
+        assert!(!qr.is_missing("0"));
+        assert!(!qr.is_missing(""));
+    }
+
+    #[test]
+    fn last_page_qr_missing_values_trim_and_ignore_case() {
+        let qr = Style::from_toml_str(
+            "[page_decoration.last_page_qr]\nmissing_values = [\"0\", \"n/a\", \" TBD \"]\n",
+        )
+        .unwrap()
+        .page_decoration
+        .last_page_qr
+        .expect("the table enables the stamp");
+        assert_eq!(qr.missing_values, ["0", "n/a", " TBD "]);
+        for value in ["0", " 0 ", "n/a", "N/A", " N/a\n", "tbd", "TBD"] {
+            assert!(qr.is_missing(value), "{value:?} should be missing");
+        }
+        // Otherwise the whole value has to match: no prefixes, no numeric
+        // equality, no item of a list.
+        for value in ["00", "0.0", "10", "n/a2", "0, 1234567", "1234567", ""] {
+            assert!(!qr.is_missing(value), "{value:?} should be a real value");
+        }
     }
 }

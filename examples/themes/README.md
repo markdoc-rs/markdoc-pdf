@@ -487,10 +487,25 @@ field isn't set) the stamp is skipped, and an empty resolved `label` hides the
 caption. Set `margin_bottom` larger than the footer band so the stamp clears
 it.
 
+Some documents have to fill in a field before its real value exists, such as
+a document number written as `0` until one is assigned. List those values in
+`missing_values`, and a field that holds one counts as not set: in `value` it
+skips the stamp, code and caption together, and in `label` it hides the
+caption. A field matches when its whole value equals an entry, both trimmed
+and ignoring case, so `"n/a"` also matches `N/A`, while `"0"` does not match
+`10` or `0.5`:
+
+```toml
+[page_decoration.last_page_qr]
+value = "https://docs.example.com/d/{documentNumber}?lang={language}"
+missing_values = ["0", "n/a"]   # no stamp until the document has a number
+```
+
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `…last_page_qr.value` | string (template) | `"{documentNumber}"` | Data encoded in the code. |
 | `…last_page_qr.label` | string (template) | `"{documentNumber}"` | Caption below the code; empty hides it. |
+| `…last_page_qr.missing_values` | array of string | `[]` | Field values that count as not set: in `value` they skip the stamp, in `label` they hide the caption. Trimmed, case ignored. Empty = every value is real. |
 | `…last_page_qr.size` | number (pt) | `54.0` | Side length of the code. |
 | `…last_page_qr.ecl` | string | `"medium"` | Error correction: `low` / `medium` / `quartile` / `high`. |
 | `…last_page_qr.margin_right` | number (pt) | `40.0` | Gap from the page's right edge. |
