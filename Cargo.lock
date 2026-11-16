@@ -789,18 +789,18 @@ dependencies = [
 
 [[package]]
 name = "markdoc-mermaid"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62b017bc89292ddb5c10279ca1374b76a2b62c18ef1877258718372c843ac35b"
+checksum = "8caf8c00ee7549127a4c0e12f2c418d8199563168f0e116d6af78060242d9955"
 dependencies = [
  "markdoc-mermaid-renderer",
 ]
 
 [[package]]
 name = "markdoc-mermaid-renderer"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f601852471785b83385098cdf36b3e1a57354ce6cb87803e0983d278c8949e2"
+checksum = "1980e3c0af5cef52cd3cb3192c58dc2d8a4c4bb6ddecab7a44e25a27395bdc26"
 dependencies = [
  "anyhow",
  "fontdb",
@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "markdoc-pdf"
-version = "0.11.2"
+version = "0.11.3"
 dependencies = [
  "clap",
  "hyphenation",
