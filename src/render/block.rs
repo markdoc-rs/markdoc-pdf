@@ -4087,7 +4087,9 @@ fn layout_mermaid(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Opt
         return None;
     }
 
-    let tree = match super::mermaid::diagram_tree(&source, ctx.crossref_labels) {
+    // The column decides how wide a label may run before it wraps, which
+    // decides the diagram's shape (`mermaid::wrap_for`).
+    let tree = match super::mermaid::diagram_tree(&source, ctx.crossref_labels, width) {
         Ok(tree) => tree,
         Err(why) => {
             // The author needs the renderer's own words: they name the line.

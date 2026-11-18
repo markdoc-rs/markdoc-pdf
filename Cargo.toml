@@ -1,6 +1,6 @@
 [package]
 name = "markdoc-pdf"
-version = "0.11.3"
+version = "0.12.0"
 edition = "2024"
 license = "MIT"
 description = "Render Markdoc documents to PDF, as a CLI or a library"
@@ -24,7 +24,7 @@ mermaid = ["dep:markdoc-mermaid"]
 
 [dependencies]
 markdoc    = "0.1.0"
-markdoc-mermaid = { version = "0.3.0", optional = true }
+markdoc-mermaid = { version = "0.4.0", optional = true }
 
 # PDF / layout stack — these used to be `*.workspace = true` against
 # the markdoc workspace. Now standalone: pin the same versions
